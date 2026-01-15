@@ -10,54 +10,51 @@ from sklearn.decomposition import PCA
 from ainr.ground_truth import generate_polygons
 from ainr.vis import plot_polygons
 
+@dataclass
+class Params:
+    weights: torch.Tensor
+    biases: torch.Tensor
 
 @dataclass
-class Surface2D:
-    vertices: np.ndarray
-    closed: bool
+class Spline:
+    t_values: List[torch.Tensor]
+    vertices: List[torch.Tensor]
+    network_values: List[torch.Tensor]
 
-@dataclass
-class Task:
-    normal: np.ndarray
-    offset: float
-    
-    threshold: float
-
-    double: bool
+    knots: torch.Tensor
+    values: torch.Tensor
 
 @dataclass
 class SubCell:
-    surfaces: List[Surface2D]
-    activations: np.ndarray
+    splines: List[Spline]
+    activations: torch.Tensor
 
 @dataclass
 class Cell:
     subcells: List[SubCell]
-    weight: np.ndarray
-    bias: np.ndarray
-    
-    tasks: List[Task]
+    weight: torch.Tensor
+    bias: torch.Tensor
 
-def split_surfaces(surfaces: List[Surface2D], normal: np.ndarray, offset: float, eps=1e-8):
-    inside_surfaces = []
-    outside_surfaces = []
+def split_surfaces(splines: List[Spline], normal: torch.Tensor, offset: torch.Tensor, eps=1e-8):
+    inside_splines = []
+    outside_splines = []
     
-    for orig_surface in surfaces:
-        SD = orig_surface.vertices @ normal + offset
+    for original_spline in splines:
+        SD = original_spline.vertices @ normal + offset
     
         SD_min = SD.min()
         SD_max = SD.max()
 
         if SD_min > -eps:
             # Case 1.1: No split - all vertices are positive
-            outside_surfaces.append(orig_surface)
+            outside_surfaces.append(original_spline)
             continue
         elif SD_max < eps:
             # Case 1.2: No split - all vertices are negative
-            inside_surfaces.append(orig_surface)
+            inside_surfaces.append(original_spline)
             continue
         
-        V = orig_surface.vertices
+        V = original_spline.vertices
         ON = np.abs(SD) <= eps
         S = np.sign(SD).astype(np.int8)
         S[ON] = 0
@@ -73,7 +70,7 @@ def split_surfaces(surfaces: List[Surface2D], normal: np.ndarray, offset: float,
                 current_V.append(V[i])
 
                 # Determine previous sign
-                if orig_surface.closed or i > 0:
+                if original_spline.closed or i > 0:
                     prev_sign = S[i-1]
                 else:
                     # i=0 and open surface - first vertex is on plane, no previous sign
@@ -91,7 +88,7 @@ def split_surfaces(surfaces: List[Surface2D], normal: np.ndarray, offset: float,
 
                 current_V = [V[i]]
                 continue
-            elif (orig_surface.closed or i > 0) and S[i] * S[i-1] == -1:
+            elif (original_spline.closed or i > 0) and S[i] * S[i-1] == -1:
                 denom = SD[i] - SD[i-1]
                 t = -SD[i-1] / denom
                 P = V[i-1] + t * (V[i] - V[i-1])
@@ -111,7 +108,7 @@ def split_surfaces(surfaces: List[Surface2D], normal: np.ndarray, offset: float,
             current_V.append(V[i])
         
         # Handle remaining vertices  
-        if orig_surface.closed and len(current_V) > 0 and (len(inside_surfaces) > first_inside_idx or 
+        if original_spline.closed and len(current_V) > 0 and (len(inside_surfaces) > first_inside_idx or 
                                     len(outside_surfaces) > first_outside_idx):
             wrap_to_inside = (S[-1] == -1) or (S[-1] == 0 and S[0] == -1)
             

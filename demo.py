@@ -3,7 +3,7 @@ Demo script for Analytic INR cell construction
 """
 import numpy as np
 import torch
-from ainr.cell import Surface2D, Cell, build_layer, collapse_layers, solve_output_layer_analytically
+from ainr.cell import Surface2D, Cell, SubCell, build_layer, collapse_layers, solve_output_layer_analytically
 from ainr.ground_truth import generate_polygons
 from ainr.vis import plot_polygons, plot_cell_sdf2 as plot_cell_sdf
 from ainr.model import ReluMLP
@@ -14,8 +14,11 @@ if __name__ == "__main__":
     # plot_polygons(polygons)
     
     surfaces = [Surface2D(polygon, True) for polygon in polygons]
-    cells = [Cell(surfaces, np.eye(2), np.zeros(2), [])]
-    mlp = ReluMLP(2, 4, 2, skip_connections=False)
+    mlp = ReluMLP(2, 8, 2, skip_connections=False)
+    
+    # Create initial subcell with activations initialized to zeros (size = hidden_dim)
+    initial_subcell = SubCell(surfaces, np.zeros(mlp.hidden_dim, dtype=np.float32))
+    cells = [Cell([initial_subcell], np.eye(2), np.zeros(2), [])]
 
     for layer in mlp.layers:
         layer.weight.data = torch.zeros_like(layer.weight.data)
@@ -30,7 +33,8 @@ if __name__ == "__main__":
         cells = collapse_layers(
             cells, 
             mlp.layers[layer_idx].weight.data, 
-            mlp.layers[layer_idx].bias.data
+            mlp.layers[layer_idx].bias.data,
+            mlp.hidden_dim if layer_idx < mlp.num_layers else 0
         )
 
     # Solve output layer analytically using boundary constraints

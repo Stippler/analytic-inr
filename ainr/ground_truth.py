@@ -6,7 +6,7 @@ from typing import List
 import numpy as np
 
 
-def generate_polygons(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0)) -> List[np.ndarray]:
+def generate_polygons(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0), rotation=0.0) -> List[np.ndarray]:
     """
     Generate non-overlapping polygons in [-1, 1]^2 based on a specification string.
     
@@ -36,6 +36,13 @@ def generate_polygons(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0)) -> 
         - List of tuples: per-polygon stretch factors
         Examples: (2.0, 1.0) stretches 2x in x-direction (rectangles from squares)
                   (1.0, 0.5) compresses in y-direction (flattened shapes)
+    
+    rotation : float, list, or np.ndarray
+        Rotation angle(s) in radians for the polygons.
+        - Single float: rotate all polygons by the same angle
+        - List/array: per-polygon rotation angles
+        Examples: 0.5 (rotate all by 0.5 radians)
+                  [0, np.pi/4, np.pi/2] (different rotation per polygon)
     
     Returns:
     --------
@@ -70,6 +77,19 @@ def generate_polygons(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0)) -> 
     else:
         stretch_list = [(1.0, 1.0)] * n_polygons
     
+    # Parse rotation parameter
+    if isinstance(rotation, (int, float)):
+        # Single value: same rotation for all polygons
+        rotation_list = [float(rotation)] * n_polygons
+    elif isinstance(rotation, (list, np.ndarray)):
+        # List/array: per-polygon rotations
+        rotation_list = list(rotation)
+        if len(rotation_list) < n_polygons:
+            # Extend with 0.0 if not enough specified
+            rotation_list.extend([0.0] * (n_polygons - len(rotation_list)))
+    else:
+        rotation_list = [0.0] * n_polygons
+    
     # Determine grid layout to fit polygons without overlap
     grid_cols = int(np.ceil(np.sqrt(n_polygons)))
     grid_rows = int(np.ceil(n_polygons / grid_cols))
@@ -93,6 +113,9 @@ def generate_polygons(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0)) -> 
         # Get stretch factors for this polygon
         sx, sy = stretch_list[idx]
         
+        # Get rotation angle for this polygon
+        angle_offset = rotation_list[idx]
+        
         # Polygon radius (inscribed in cell with padding, accounting for stretch)
         # Ensure stretched polygon fits within cell boundaries
         radius_x = (cell_width / 2) * 0.8 / sx if sx > 0 else cell_width * 0.4
@@ -100,15 +123,15 @@ def generate_polygons(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0)) -> 
         radius = min(radius_x, radius_y)
         
         if convex:
-            # Generate regular convex polygon vertices
+            # Generate regular convex polygon vertices (centered at origin)
             angles = np.linspace(0, 2 * np.pi, n_vertices, endpoint=False)
             angles += idx * 0.3
             
             vertices = np.zeros((n_vertices, 2))
-            vertices[:, 0] = cell_center_x + radius * sx * np.cos(angles)
-            vertices[:, 1] = cell_center_y + radius * sy * np.sin(angles)
+            vertices[:, 0] = radius * sx * np.cos(angles)
+            vertices[:, 1] = radius * sy * np.sin(angles)
         else:
-            # Generate non-convex star-like polygon
+            # Generate non-convex star-like polygon (centered at origin)
             n_points = n_vertices * 2
             angles = np.linspace(0, 2 * np.pi, n_points, endpoint=False)
             angles += idx * 0.3
@@ -119,8 +142,20 @@ def generate_polygons(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0)) -> 
             radii[1::2] = radius * star_ratio
             
             vertices = np.zeros((n_points, 2))
-            vertices[:, 0] = cell_center_x + radii * sx * np.cos(angles)
-            vertices[:, 1] = cell_center_y + radii * sy * np.sin(angles)
+            vertices[:, 0] = radii * sx * np.cos(angles)
+            vertices[:, 1] = radii * sy * np.sin(angles)
+        
+        # Apply rotation using rotation matrix (after stretch)
+        if angle_offset != 0:
+            cos_a = np.cos(angle_offset)
+            sin_a = np.sin(angle_offset)
+            rotation_matrix = np.array([[cos_a, -sin_a],
+                                       [sin_a, cos_a]])
+            vertices = vertices @ rotation_matrix.T
+        
+        # Translate to cell center
+        vertices[:, 0] += cell_center_x
+        vertices[:, 1] += cell_center_y
         
         polygons.append(vertices)
     
