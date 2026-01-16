@@ -17,9 +17,17 @@ from geomloss import SamplesLoss
 from tqdm import tqdm
 
 from marching import arch as architectures
+from sdf_meshing import create_mesh
 import trimesh
 
 root_dir = Path(__file__).parent.parent
+
+SEED = 42
+
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
@@ -32,18 +40,19 @@ def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
         num_samples: Number of points to sample for evaluation
     """
     device = next(model.parameters()).device
+    generator = torch.Generator(device=device).manual_seed(SEED)
     
     # --- PREPARE DATA ---
     # 1. Load GT Mesh
     mesh_gt = trimesh.load(gt_mesh_path)
     
     # 2. Sample points on GT surface (for Direction 1)
-    points_gt, _ = trimesh.sample.sample_surface(mesh_gt, num_samples)
+    points_gt, _ = trimesh.sample.sample_surface(mesh_gt, num_samples, seed=SEED)
     points_gt_tensor = torch.tensor(points_gt, dtype=torch.float32, device=device)
 
     # 3. Prepare "Near Surface" points (for Direction 2)
     # We add noise to GT points to start "near" the surface, then project them
-    noise = torch.randn_like(points_gt_tensor) * 0.05
+    noise = torch.randn(points_gt_tensor.size(), generator=generator, device=device) * 0.05
     points_to_project = points_gt_tensor + noise
     points_to_project.requires_grad_(True)
 
@@ -105,10 +114,11 @@ def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
     emd_loss = SamplesLoss("sinkhorn", p=1, blur=0.005, backend="tensorized")
 
     # Example Data (Batch, N_points, 3)
-    # neural_points: (1, 10000, 3) projected from your SDF
-    # gt_points: (1, 10000, 3) sampled from mesh
+    # take the first 5000 points to compute the EMD loss
+    # to avoid OOM
+    torch.cuda.empty_cache()
     with torch.no_grad():
-        emd_loss_tensor = emd_loss(p_current[500:], points_gt_tensor[500:])
+        emd_loss_tensor = emd_loss(p_current[:5000].cuda(), points_gt_tensor[:5000].cuda())
 
     return {
         "chamfer_l1": chamfer_l1.item(),
@@ -119,10 +129,12 @@ def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
         "emd_loss": emd_loss_tensor.item()
     }
 
-def eval(task_name, arch_name, mesh_name):
-    net_dir = root_dir / "nets" / task_name / arch_name / mesh_name
+def eval(task_name, arch_name, mesh_name, save_mesh=True):
+    # path is to get rid of the .ply extension
+    net_dir = root_dir / "nets" / task_name / arch_name / Path(mesh_name).stem
     
     if not net_dir.exists():
+        return
         raise FileNotFoundError(f"Net directory {net_dir} not found")
     
     net = architectures.by_name(arch_name).cuda()
@@ -131,7 +143,7 @@ def eval(task_name, arch_name, mesh_name):
 
     net.eval()
 
-    gt_mesh_path = root_dir / "data" / "meshes" / f"{mesh_name}.ply"
+    gt_mesh_path = root_dir / "data" / "meshes" / f"{Path(mesh_name).stem}.ply"
     if not gt_mesh_path.exists():
         raise FileNotFoundError(f"Ground truth mesh file {gt_mesh_path} not found")
     metrics = compute_meshless_metrics(net, gt_mesh_path)
@@ -145,14 +157,24 @@ def eval(task_name, arch_name, mesh_name):
     with open(net_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=4)
         
-    from sdf_meshing import create_mesh
-    create_mesh(net, net_dir / "mesh.ply", N=512)
+    if save_mesh:
+        create_mesh(net, net_dir / "mesh.ply", N=512)
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Trains SDF neural networks from point clouds.")
     parser.add_argument("--task", required=True)
-    parser.add_argument("--arch", action="extend", nargs="+", required=True)
-    parser.add_argument("--mesh", action="extend", nargs="+", required=True)
+    # if the following arguments are not provided, all nets and meshes will be evaluated
+    parser.add_argument("--arch", action="extend", nargs="+", required=False)
+    parser.add_argument("--mesh", action="extend", nargs="+", required=False)
+    parser.add_argument("--save_mesh", action="store_true", required=False)
     args = parser.parse_args()
-    for call in tqdm(list(product(args.arch, args.mesh)), desc="nets"):
-        eval(args.task, *call)
+    
+    calls = []
+    task_dir = root_dir / "nets" / args.task
+    mesh_dir = root_dir / "data" / "meshes"
+    
+    arch = args.arch or (p.name for p in task_dir.iterdir())
+    mesh = args.mesh or (p.name for p in mesh_dir.iterdir())
+    
+    for call in tqdm(list(product(arch, mesh)), desc="nets"):
+        eval(args.task, *call, args.save_mesh)
