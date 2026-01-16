@@ -218,3 +218,5 @@ __marimo__/
 # point clouds (for sdf learning)
 data/sdf_point_clouds/*.ply
 nets/
+data/meshes/
+data/
