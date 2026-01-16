@@ -6,4 +6,5 @@ pysdf>=0.1.9
 open3d>=0.17.0
 trimesh==4.11.0
 # Alternative for faster batched SDF queries (optional): point-cloud-utils
-
+plyfile>=1.1.0
+scikit-image==0.26.0

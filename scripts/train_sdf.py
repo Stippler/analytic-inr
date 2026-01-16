@@ -90,6 +90,7 @@ def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
     # Chamfer Distance (L1 or L2)
     # Mean of both directions
     chamfer_l1 = 0.5 * (torch.mean(dist_gt_to_neural) + torch.mean(dist_neural_to_gt))
+    chamfer_l1_median = 0.5 * (torch.median(dist_gt_to_neural) + torch.median(dist_neural_to_gt))
     
     # Hausdorff Distance
     # Max of the distances (worst-case error)
@@ -111,6 +112,7 @@ def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
 
     return {
         "chamfer_l1": chamfer_l1.item(),
+        "chamfer_l1_median": chamfer_l1_median.item(),
         "hausdorff": hausdorff.item(),
         "dist_gt_to_neural_mean": torch.mean(dist_gt_to_neural).item(),
         "dist_neural_to_gt_mean": torch.mean(dist_neural_to_gt).item(),
@@ -214,6 +216,9 @@ def train(task_name, arch_name, mesh_name, n_iters):
     import json
     with open(net_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=4)
+        
+    from sdf_meshing import create_mesh
+    create_mesh(net, net_dir / "mesh.ply", N=512)
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Trains SDF neural networks from point clouds.")
