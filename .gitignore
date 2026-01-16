@@ -214,3 +214,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# point clouds (for sdf learning)
+data/sdf_point_clouds/*.ply
+nets/
