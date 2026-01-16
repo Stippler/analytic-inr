@@ -2,6 +2,113 @@ import numpy as np
 import torch
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
+from pytorch3d.structures import Meshes
+from pytorch3d.ops import knn_points
+from pytorch3d.ops.sample_points_from_meshes import sample_points_from_meshes
+
+
+def _vectorized_parity_signs(B, N, hit_ray_idxs, hit_t_vals):
+    """
+    Computes sign via sweep-line: sorts samples and hits together, counts crossings.
+    """
+    # Create event flags: Samples=0, Hits=1
+    sample_ray_idxs = np.repeat(np.arange(B), N)
+    sample_t_vals = np.tile(np.linspace(0, 1, N), B)
+    
+    all_ray_idxs = np.concatenate([sample_ray_idxs, hit_ray_idxs])
+    all_t_vals = np.concatenate([sample_t_vals, hit_t_vals])
+    all_flags = np.concatenate([np.zeros(B*N, dtype=np.int8), np.ones(len(hit_t_vals), dtype=np.int8)])
+    
+    # Sort events by Ray ID, then T value
+    sorter = np.lexsort((all_flags, all_t_vals, all_ray_idxs))
+    sorted_flags = all_flags[sorter]
+    
+    # Cumulative sum of hits (flags)
+    counts = np.cumsum(sorted_flags)
+    
+    # Filter to keep only sample rows
+    is_sample = sorted_flags == 0
+    sample_counts = counts[is_sample]
+    
+    # Correct for previous rays' hit counts ("reset" count at start of each ray)
+    hit_counts_per_ray = np.bincount(hit_ray_idxs, minlength=B)
+    ray_offsets = np.concatenate(([0], np.cumsum(hit_counts_per_ray)))[:-1]
+    corrections = np.repeat(ray_offsets, N)
+    
+    true_counts = sample_counts - corrections
+    
+    # Even hits = Outside (+1), Odd hits = Inside (-1)
+    signs = np.ones(B*N, dtype=np.float32)
+    signs[true_counts % 2 == 1] = -1.0
+    return signs
+
+
+def compute_batch_sdf(mesh, ray_starts, ray_ends, n_samples=1000, device='cuda', verbose=False):
+    """
+    Computes SDF for a batch of rays in a single pass using GPU distance and CPU ray-tracing.
+    
+    Args:
+        mesh: trimesh.Trimesh object (watertight).
+        ray_starts: (B, 3) array/tensor, must be OUTSIDE the mesh.
+        ray_ends:   (B, 3) array/tensor, target points.
+        n_samples:  Samples per ray.
+        device: torch device for GPU computation
+        verbose: Print GPU diagnostics
+    
+    Returns:
+        t: (N,) array of parameter values
+        sdf: (B, N) tensor of signed distance values
+    """
+    if verbose:
+        print(f"  [compute_batch_sdf] Using device: {device}")
+        print(f"  [compute_batch_sdf] CUDA available: {torch.cuda.is_available()}")
+    
+    # 1. Setup Data & GPU
+    if isinstance(ray_starts, np.ndarray):
+        ray_starts = torch.from_numpy(ray_starts).to(device).float()
+        ray_ends = torch.from_numpy(ray_ends).to(device).float()
+    
+    verts_gpu = torch.tensor(mesh.vertices, dtype=torch.float32, device=device).unsqueeze(0)  # (1, V, 3)
+    faces_gpu = torch.tensor(mesh.faces, dtype=torch.int64, device=device).unsqueeze(0)  # (1, F, 3)
+    
+    B = ray_starts.shape[0]
+    t = torch.linspace(0, 1, n_samples, device=device) # (N,)
+    
+    # 2. Generate Points (B, N, 3)
+    rays_vec = ray_ends - ray_starts
+    points = ray_starts.unsqueeze(1) + t.view(1, n_samples, 1) * rays_vec.unsqueeze(1)
+    points_flat = points.reshape(-1, 3)
+
+    # 3. GPU Unsigned Distance using mesh face samples
+    # Sample points on mesh faces for KNN
+    mesh_pytorch3d = Meshes(verts=verts_gpu, faces=faces_gpu)
+    mesh_samples = sample_points_from_meshes(mesh_pytorch3d, num_samples=50000)  # (1, N_samples, 3)
+    
+    # Use KNN to find distances
+    knn_result = knn_points(points_flat.unsqueeze(0), mesh_samples, K=1)
+    udf = torch.sqrt(knn_result.dists[0, :, 0]).reshape(B, n_samples)
+
+    # 4. CPU Intersection & Sign Calculation (Parity Check)
+    # Force tree build once if not exists
+    if not hasattr(mesh.ray, '_tree'): 
+        _ = mesh.ray.intersects_any([[0,0,0]], [[0,0,1]])
+    
+    starts_cpu = ray_starts.cpu().numpy()
+    dirs_cpu = rays_vec.cpu().numpy()
+    
+    # Get all intersections: hits is (M, 3), ray_idx is (M,), tri_idx is (M,)
+    hits, ray_idx, _ = mesh.ray.intersects_location(starts_cpu, dirs_cpu)
+    
+    # Calculate 't' for hits by projecting onto ray direction
+    hit_vecs = hits - starts_cpu[ray_idx]
+    ray_lens_sq = np.sum(dirs_cpu[ray_idx]**2, axis=1)
+    hit_t_vals = np.sum(hit_vecs * dirs_cpu[ray_idx], axis=1) / ray_lens_sq
+    
+    # Vectorized sweep-line to determine signs
+    signs_flat = _vectorized_parity_signs(B, n_samples, ray_idx, hit_t_vals)
+    signs = torch.from_numpy(signs_flat).to(device).reshape(B, n_samples)
+    
+    return t.cpu().numpy(), (udf * signs)
 
 
 @dataclass
@@ -179,36 +286,27 @@ def flatten_tree(node: Optional[PCANode]) -> List[AxisSegment]:
     return segments
 
 
-def compute_sdf_sampling_3d(p_start, p_end, mesh, n_samples=200):
+def compute_sdf_sampling_3d(p_start, p_end, mesh, n_samples=1000, device='cuda', verbose=False):
     """
-    Compute SDF along line segment using trimesh proximity queries.
+    Compute SDF along line segment using GPU-accelerated batch computation.
     
-    Optimized version that uses normal direction for sign instead of contains(),
-    which is much faster for large meshes.
+    Args:
+        p_start: Start point of line segment (3,)
+        p_end: End point of line segment (3,)
+        mesh: trimesh.Trimesh object
+        n_samples: Number of samples along the line
+        device: torch device for GPU computation
+        verbose: Print GPU diagnostics on first call
+    
+    Returns:
+        t: (N,) array of parameter values
+        sdf: (N,) array of signed distance values
     """
-    t = np.linspace(0, 1, n_samples)
-    points = p_start + t[:, None] * (p_end - p_start)
-    
-    # Get closest points and distances (fast with rtree if installed)
-    closest_points, distances, triangle_id = mesh.nearest.on_surface(points)
-    
-    # Determine sign using surface normals (much faster than contains())
-    # If point-to-surface vector points opposite to surface normal, we're inside
-    face_normals = mesh.face_normals[triangle_id]
-    to_surface = closest_points - points
-    
-    # Normalize to_surface vectors
-    to_surface_norm = np.linalg.norm(to_surface, axis=1, keepdims=True)
-    to_surface_norm = np.where(to_surface_norm > 1e-10, to_surface_norm, 1.0)
-    to_surface_normalized = to_surface / to_surface_norm
-    
-    # Dot product: positive if same direction (outside), negative if opposite (inside)
-    dot_products = np.sum(to_surface_normalized * face_normals, axis=1)
-    
-    # Sign: negative inside, positive outside
-    sdf = np.where(dot_products < 0, -distances, distances)
-    
-    return t, sdf
+    # Batch of 1 ray
+    ray_starts = np.array([p_start])
+    ray_ends = np.array([p_end])
+    t, sdf_batch = compute_batch_sdf(mesh, ray_starts, ray_ends, n_samples, device, verbose=verbose)
+    return t, sdf_batch[0].cpu().numpy()
 
 
 def compute_sdf_sampling(p_start, p_end, polygons, n_samples=1000):

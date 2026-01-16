@@ -1120,3 +1120,211 @@ def plot_polygons(polygons, figsize=(8, 8), title="Polygons"):
     plt.title(title)
     plt.grid(True, alpha=0.3)
     plt.show()
+
+
+def plot_splines_3d(splines, save_path=None):
+    """
+    Plot 3D splines with PC1, PC2, PC3 arranged per row.
+    
+    Args:
+        splines: List of Spline objects
+        save_path: If provided, save to this path instead of showing
+    """
+    if splines is None or len(splines) == 0:
+        return
+    
+    # Color mapping function
+    def get_color_for_spline(spline):
+        depth = spline.depth if hasattr(spline, 'depth') else 0
+        label = spline.label if hasattr(spline, 'label') else ''
+        
+        if depth == 0:
+            return '#8B00FF'
+        elif depth == 1:
+            octant_colors = {
+                '+++': '#FF0000',
+                '++-': '#FF6B00',
+                '+-+': '#FFD700',
+                '+--': '#00C853',
+                '-++': '#00CED1',
+                '-+-': '#FF00FF',
+                '--+': '#FF1493',
+                '---': '#4169E1'
+            }
+            for octant in octant_colors.keys():
+                if octant in label:
+                    return octant_colors[octant]
+            return '#FF0000'
+        else:
+            return '#00B8D4'
+    
+    # Organize splines by groups (PC1, PC2, PC3)
+    pc1_splines = [s for s in splines if hasattr(s, 'pc_type') and s.pc_type == 'pc1']
+    pc2_splines = [s for s in splines if hasattr(s, 'pc_type') and s.pc_type == 'pc2']
+    pc3_splines = [s for s in splines if hasattr(s, 'pc_type') and s.pc_type == 'pc3']
+    
+    # Match splines by their base label
+    pc1_dict = {}
+    for s in pc1_splines:
+        base_label = s.label.replace('/pc1', '').replace('pc1', '').strip().rstrip(':')
+        pc1_dict[base_label] = s
+    
+    pc2_dict = {}
+    for s in pc2_splines:
+        base_label = s.label.replace('/pc2', '').replace('pc2', '').strip().rstrip(':')
+        pc2_dict[base_label] = s
+    
+    pc3_dict = {}
+    for s in pc3_splines:
+        base_label = s.label.replace('/pc3', '').replace('pc3', '').strip().rstrip(':')
+        pc3_dict[base_label] = s
+    
+    # Create groups
+    all_labels = sorted(set(list(pc1_dict.keys()) + list(pc2_dict.keys()) + list(pc3_dict.keys())))
+    spline_groups = []
+    for label in all_labels:
+        group = []
+        if label in pc1_dict:
+            group.append(pc1_dict[label])
+        if label in pc2_dict:
+            group.append(pc2_dict[label])
+        if label in pc3_dict:
+            group.append(pc3_dict[label])
+        if group:
+            spline_groups.append((label, group))
+    
+    # Create plot
+    n_rows = len(spline_groups)
+    n_cols = 3  # PC1, PC2, PC3
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 3 * n_rows))
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    
+    for row_idx, (label, group) in enumerate(spline_groups):
+        for col_idx, spline in enumerate(group):
+            ax = axes[row_idx, col_idx]
+            color = get_color_for_spline(spline)
+            
+            # Ground truth
+            gt_t = spline.gt_knots.cpu().numpy()
+            gt_sdf = spline.gt_values.cpu().numpy()
+            
+            ax.plot(gt_t, gt_sdf, 'o-', color=color, 
+                   lw=2, markersize=4, alpha=1.0, 
+                   markerfacecolor='white', markeredgewidth=1.5, 
+                   markeredgecolor=color, label='GT')
+            
+            # Predicted
+            if hasattr(spline, 'pred_knots') and spline.pred_knots is not None and spline.pred_values is not None:
+                pred_t = spline.pred_knots.detach().cpu().numpy()
+                pred_sdf = spline.pred_values.detach().cpu().numpy()
+                
+                ax.plot(pred_t, pred_sdf, 's-', color='#00CED1', 
+                       lw=2, markersize=4, alpha=0.8, 
+                       markerfacecolor='white', markeredgewidth=1.5, 
+                       markeredgecolor='#00CED1', label='Pred')
+            
+            ax.axhline(0, color='black', linestyle=':', alpha=0.3, linewidth=1)
+            ax.grid(alpha=0.2, linestyle='--')
+            ax.set_title(spline.label if hasattr(spline, 'label') else '', 
+                        fontsize=9, fontweight='bold')
+            ax.set_xlabel('t', fontsize=8)
+            ax.set_ylabel('SDF', fontsize=8)
+            ax.tick_params(labelsize=7)
+            ax.legend(fontsize=7, loc='best')
+        
+        # Hide unused subplots in the row
+        for col_idx in range(len(group), n_cols):
+            axes[row_idx, col_idx].axis('off')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def extract_mesh_from_mlp_3d(
+    model,
+    resolution: int = 64,
+    bbox_min: float = -1.0,
+    bbox_max: float = 1.0,
+    device=None
+):
+    """
+    Extract mesh from 3D SDF MLP using marching cubes.
+    
+    Args:
+        model: Neural network model (ReluMLP)
+        resolution: Grid resolution for marching cubes
+        bbox_min: Minimum coordinate of bounding box
+        bbox_max: Maximum coordinate of bounding box
+        device: Device to run computations on
+    
+    Returns:
+        trimesh.Trimesh object or None if extraction failed
+    """
+    try:
+        from skimage import measure
+        import trimesh
+    except ImportError:
+        print("Warning: scikit-image or trimesh not available, cannot extract mesh")
+        return None
+    
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    print(f"  Extracting mesh with marching cubes (resolution={resolution})...")
+    
+    # Create 3D grid
+    x = torch.linspace(bbox_min, bbox_max, resolution)
+    y = torch.linspace(bbox_min, bbox_max, resolution)
+    z = torch.linspace(bbox_min, bbox_max, resolution)
+    
+    # Evaluate SDF on grid
+    print("  Evaluating SDF on 3D grid...")
+    sdf_grid = np.zeros((resolution, resolution, resolution))
+    
+    # Process in batches to avoid memory issues
+    batch_size = 100000
+    model = model.to(device)
+    model.eval()
+    
+    with torch.no_grad():
+        for i in range(resolution):
+            if i % 10 == 0:
+                print(f"    Processing slice {i}/{resolution}...")
+            
+            yy, zz = torch.meshgrid(y, z, indexing='ij')
+            xx = torch.full_like(yy, x[i])
+            grid_pts = torch.stack([xx.flatten(), yy.flatten(), zz.flatten()], dim=1).to(device)
+            
+            # Process in sub-batches
+            n_points = grid_pts.shape[0]
+            sdf_slice = []
+            for j in range(0, n_points, batch_size):
+                batch = grid_pts[j:min(j+batch_size, n_points)]
+                sdf_batch = model(batch).squeeze().cpu().numpy()
+                sdf_slice.append(sdf_batch)
+            
+            sdf_grid[i] = np.concatenate(sdf_slice).reshape(resolution, resolution)
+    
+    # Run marching cubes
+    print("  Running marching cubes algorithm...")
+    try:
+        vertices, faces, normals, _ = measure.marching_cubes(sdf_grid, level=0.0)
+        
+        # Convert to world coordinates
+        vertices = vertices / (resolution - 1) * (bbox_max - bbox_min) + bbox_min
+        
+        # Create mesh
+        mesh = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_normals=normals)
+        
+        print(f"  Extracted mesh: {len(vertices)} vertices, {len(faces)} faces")
+        return mesh
+    except Exception as e:
+        print(f"  Warning: Marching cubes failed: {e}")
+        return None

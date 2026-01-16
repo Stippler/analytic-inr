@@ -187,6 +187,18 @@ def train_model(mlp: ReluMLP,
     Returns:
         loss_history: List of average loss per epoch
     """
+    # GPU Diagnostic
+    device = next(mlp.parameters()).device
+    print("\n" + "="*60)
+    print("GPU DIAGNOSTIC - Regular Training")
+    print("="*60)
+    print(f"Device: {device}")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        print(f"Model on GPU: {device.type == 'cuda'}")
+    print("="*60 + "\n")
+    
     optimizer = optim.Adam(mlp.parameters(), lr=lr)
     loss_history = []
     best_loss = float('inf')

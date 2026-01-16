@@ -12,8 +12,9 @@ from .preprocess import preprocess_polygons_to_splines
 from .spline import Spline
 from .model import ReluMLP
 from .train import train_model, reset_predictions, compute_metrics
+from .train_fast import train_model_fast, update_spline_predictions
 from .metrics import compute_sdf_metrics, print_metrics
-from .vis import plot_sdf_heatmap, plot_splines
+from .vis import plot_sdf_heatmap, plot_splines, plot_splines_3d, extract_mesh_from_mlp_3d
 
 
 @click.group()
@@ -31,7 +32,8 @@ def cli():
 @click.option('--batch-size', type=int, default=8, help='Batch size for training')
 @click.option('--lr', type=float, default=0.01, help='Learning rate')
 @click.option('--save/--no-save', default=True, help='Save experiment results')
-def train_2d(dataset, epochs, hidden_dim, num_layers, batch_size, lr, save):
+@click.option('--fast/--no-fast', default=False, help='Use fast batched training implementation')
+def train_2d(dataset, epochs, hidden_dim, num_layers, batch_size, lr, save, fast):
     """Train on 2D polygon datasets."""
     input_dim = 2
     
@@ -72,13 +74,22 @@ def train_2d(dataset, epochs, hidden_dim, num_layers, batch_size, lr, save):
     mlp = ReluMLP(input_dim, hidden_dim, num_layers, skip_connections=False)
     n_params = sum(p.numel() for p in mlp.parameters())
     
-    click.echo(f"Training {dataset} | {n_params} params | {len(splines)} splines | {epochs} epochs")
+    mode_str = "FAST" if fast else "Original"
+    click.echo(f"Training {dataset} ({mode_str}) | {n_params} params | {len(splines)} splines | {epochs} epochs")
     
-    loss_history = train_model(mlp, splines, epochs=epochs, batch_size=batch_size, 
-                               lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
-    
-    # Compute metrics
-    reset_predictions(mlp, splines)
+    if fast:
+        # Use fast batched training
+        # Increase batch size for fast mode if using default
+        loss_history = train_model_fast(mlp, splines, epochs=epochs, batch_size=batch_size, 
+                                       lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
+        # Update predictions for metrics
+        update_spline_predictions(mlp, splines)
+    else:
+        # Use original training
+        loss_history = train_model(mlp, splines, epochs=epochs, batch_size=batch_size, 
+                                   lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
+        # Compute metrics
+        reset_predictions(mlp, splines)
     spline_metrics = compute_metrics(splines)
     sdf_metrics = compute_sdf_metrics(mlp, polygons, n_samples=10000, bbox_min=-1.0, bbox_max=1.0)
     
@@ -124,7 +135,6 @@ def train_2d(dataset, epochs, hidden_dim, num_layers, batch_size, lr, save):
 
 
 @cli.command()
-@click.option('--dataset', type=str, default='stanford', help='Dataset name')
 @click.option('--model-name', type=str, default='Armadillo.ply', help='Model filename')
 @click.option('--epochs', type=int, default=1000, help='Number of training epochs')
 @click.option('--hidden-dim', type=int, default=32, help='Hidden dimension of the MLP')
@@ -132,12 +142,13 @@ def train_2d(dataset, epochs, hidden_dim, num_layers, batch_size, lr, save):
 @click.option('--batch-size', type=int, default=8, help='Batch size for training')
 @click.option('--lr', type=float, default=0.01, help='Learning rate')
 @click.option('--save/--no-save', default=True, help='Save experiment results')
-def train_3d(dataset, model_name, epochs, hidden_dim, num_layers, batch_size, lr, save):
+@click.option('--fast/--no-fast', default=False, help='Use fast batched training implementation')
+def train_3d(model_name, epochs, hidden_dim, num_layers, batch_size, lr, save, fast):
     """Train on 3D mesh datasets."""
     import trimesh
     
     input_dim = 3
-    mesh_path = Path('data') / dataset / model_name
+    mesh_path = Path('data') / 'meshes' / model_name
     
     if not mesh_path.exists():
         click.echo(f"Error: Mesh not found at {mesh_path}", err=True)
@@ -180,8 +191,11 @@ def train_3d(dataset, model_name, epochs, hidden_dim, num_layers, batch_size, lr
     labels = [label for _, label in all_lines_data]
     click.echo(f"  Generated {len(line_segments)} line segments")
     
-    # Compute SDF along each line using trimesh
+    # Compute SDF along each line using trimesh (GPU-accelerated if available)
     click.echo("Computing SDF along lines and simplifying to knots...")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        click.echo(f"  Using GPU-accelerated SDF computation")
     all_knots = []
     from .preprocess import simplify_sdf_to_knots
     
@@ -189,8 +203,8 @@ def train_3d(dataset, model_name, epochs, hidden_dim, num_layers, batch_size, lr
         if idx % 10 == 0:
             click.echo(f"  Processing line {idx+1}/{len(line_segments)}...")
         
-        # Reduce samples for 3D - still enough resolution but much faster
-        t, sdf = compute_sdf_sampling_3d(p_start, p_end, mesh, n_samples=200)
+        # Compute SDF with high resolution sampling (verbose on first iteration)
+        t, sdf = compute_sdf_sampling_3d(p_start, p_end, mesh, n_samples=1000, device=device, verbose=(idx==0))
         
         # Simplify to knots
         knot_t, knot_sdf, max_err, mean_err = simplify_sdf_to_knots(t, sdf, tolerance=0.005)
@@ -228,15 +242,41 @@ def train_3d(dataset, model_name, epochs, hidden_dim, num_layers, batch_size, lr
     mlp = ReluMLP(input_dim, hidden_dim, num_layers, skip_connections=False)
     n_params = sum(p.numel() for p in mlp.parameters())
     
-    click.echo(f"Training {dataset}/{model_name} | {n_params} params | {len(splines)} splines | {epochs} epochs")
+    # Check GPU availability and move model/data to GPU
+    if torch.cuda.is_available():
+        click.echo(f"✓ CUDA available: {torch.cuda.get_device_name(0)}")
+        click.echo(f"✓ Moving model to GPU...")
+        mlp = mlp.cuda()
+        # Move splines to GPU
+        for spline in splines:
+            spline.start_point = spline.start_point.cuda()
+            spline.end_point = spline.end_point.cuda()
+            spline.gt_knots = spline.gt_knots.cuda()
+            spline.gt_values = spline.gt_values.cuda()
+        click.echo(f"✓ Model and data moved to GPU")
+    else:
+        click.echo("⚠ CUDA not available, using CPU")
+    
+    mode_str = "FAST" if fast else "Original"
+    click.echo(f"Training {dataset}/{model_name} ({mode_str}) | {n_params} params | {len(splines)} splines | {epochs} epochs")
     click.echo("Starting training...")
     
-    loss_history = train_model(mlp, splines, epochs=epochs, batch_size=batch_size,
-                               lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
-    
-    # Compute metrics
-    click.echo("\nComputing spline metrics...")
-    reset_predictions(mlp, splines)
+    if fast:
+        # Use fast batched training
+        # Increase batch size for fast mode if using default
+        fast_batch_size = max(batch_size, 64) if batch_size == 8 else batch_size
+        loss_history = train_model_fast(mlp, splines, epochs=epochs, batch_size=fast_batch_size,
+                                       lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
+        # Update predictions for metrics
+        click.echo("\nUpdating spline predictions...")
+        update_spline_predictions(mlp, splines)
+    else:
+        # Use original training
+        loss_history = train_model(mlp, splines, epochs=epochs, batch_size=batch_size,
+                                   lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
+        # Compute metrics
+        click.echo("\nComputing spline metrics...")
+        reset_predictions(mlp, splines)
     spline_metrics = compute_metrics(splines)
     
     # Compute 3D SDF metrics
@@ -246,6 +286,12 @@ def train_3d(dataset, model_name, epochs, hidden_dim, num_layers, batch_size, lr
     
     click.echo(f"\nResults: MAE={sdf_metrics['mae']:.6f} | IoU={sdf_metrics['iou_interior']:.4f} | "
                f"Sign Acc={sdf_metrics['sign_accuracy']:.4f}")
+    
+    # Extract and save predicted mesh using marching cubes
+    predicted_mesh = None
+    if save:
+        click.echo("\nExtracting predicted mesh using marching cubes...")
+        predicted_mesh = extract_mesh_from_mlp_3d(mlp, resolution=64, bbox_min=-1.0, bbox_max=1.0)
     
     if save:
         click.echo("Saving results...")
@@ -275,8 +321,14 @@ def train_3d(dataset, model_name, epochs, hidden_dim, num_layers, batch_size, lr
         
         np.save(exp_dir / 'loss_history.npy', np.array(loss_history))
         
-        # Save mesh for reference
-        mesh.export(exp_dir / 'mesh.ply')
+        # Plot and save 3D splines
+        click.echo("Plotting 3D splines...")
+        plot_splines_3d(splines, save_path=exp_dir / 'spline_predictions.png')
+        
+        # Save extracted mesh
+        if predicted_mesh is not None:
+            click.echo("Saving predicted mesh...")
+            predicted_mesh.export(exp_dir / 'predicted_mesh.ply')
         
         click.echo(f"Saved to: {exp_dir}")
 

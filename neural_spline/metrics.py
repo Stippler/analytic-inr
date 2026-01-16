@@ -8,6 +8,52 @@ computed from polygons/meshes. Inspired by metrics used in SIREN, DeepSDF, and r
 import torch
 import numpy as np
 from typing import List, Tuple, Dict
+from pytorch3d.structures import Meshes
+from pytorch3d.ops import knn_points
+from pytorch3d.ops.sample_points_from_meshes import sample_points_from_meshes
+
+
+def _compute_gt_sdf_batch_gpu(mesh, points_np, device, batch_size=50000):
+    """
+    Compute ground truth SDF using GPU-accelerated distance computation.
+    
+    Args:
+        mesh: trimesh.Trimesh object
+        points_np: (N, 3) numpy array of query points
+        device: torch device
+        batch_size: Process points in batches to avoid OOM
+    
+    Returns:
+        sdf: (N,) numpy array of signed distance values
+    """
+    n_points = len(points_np)
+    sdf_values = np.zeros(n_points, dtype=np.float32)
+    
+    # Convert mesh to PyTorch3D format once
+    verts_gpu = torch.tensor(mesh.vertices, dtype=torch.float32, device=device).unsqueeze(0)  # (1, V, 3)
+    faces_gpu = torch.tensor(mesh.faces, dtype=torch.int64, device=device).unsqueeze(0)  # (1, F, 3)
+    mesh_pytorch3d = Meshes(verts=verts_gpu, faces=faces_gpu)
+    mesh_samples = sample_points_from_meshes(mesh_pytorch3d, num_samples=50000)  # (1, N_samples, 3)
+    
+    # Process in batches to avoid OOM
+    for i in range(0, n_points, batch_size):
+        end_idx = min(i + batch_size, n_points)
+        batch_points = points_np[i:end_idx]
+        
+        # GPU distance computation using KNN
+        points_gpu = torch.from_numpy(batch_points).float().to(device).unsqueeze(0)  # (1, N, 3)
+        knn_result = knn_points(points_gpu, mesh_samples, K=1)
+        distances = torch.sqrt(knn_result.dists[0, :, 0]).cpu().numpy()
+        
+        # CPU inside/outside check (still faster overall)
+        inside = mesh.contains(batch_points)
+        
+        # Signed distance
+        sdf_batch = distances
+        sdf_batch[inside] *= -1
+        sdf_values[i:end_idx] = sdf_batch
+    
+    return sdf_values
 
 
 def compute_ground_truth_sdf_2d(points: np.ndarray, polygons: List[np.ndarray]) -> np.ndarray:
@@ -327,6 +373,7 @@ def compute_sdf_metrics_3d(
 ) -> Dict[str, float]:
     """
     Compute comprehensive SDF quality metrics for a 3D INR model.
+    Uses GPU-accelerated batch computation with PyTorch3D.
     
     Args:
         model: Neural network model (ReluMLP)
@@ -339,24 +386,26 @@ def compute_sdf_metrics_3d(
     Returns:
         Dictionary of metric names to values
     """
+    print(f"  Sampling {n_samples} random points...")
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Sample random points in the domain
     points_np = np.random.uniform(bbox_min, bbox_max, (n_samples, 3))
     
-    # Compute ground truth SDF using trimesh
-    closest_points, distances, triangle_id = mesh.nearest.on_surface(points_np)
-    inside = mesh.contains(points_np)
-    gt_sdf = np.where(inside, -distances, distances)
+    # Compute ground truth SDF using GPU-accelerated method
+    print("  Computing ground truth SDF using GPU-accelerated method...")
+    gt_sdf = _compute_gt_sdf_batch_gpu(mesh, points_np, device)
     
     # Compute predicted SDF
+    print("  Computing predicted SDF from model...")
     points_torch = torch.from_numpy(points_np).float().to(device)
     with torch.no_grad():
         model = model.to(device)
         pred_sdf = model(points_torch).squeeze().cpu().numpy()
     
     # Compute metrics
+    print("  Computing error metrics...")
     abs_errors = np.abs(pred_sdf - gt_sdf)
     squared_errors = (pred_sdf - gt_sdf) ** 2
     
