@@ -7,8 +7,12 @@ from datetime import datetime
 from pytorch3d.io import load_ply
 
 from .polygons import generate_polygons
-from .pca import recursive_pca_decomposition, flatten_pca_tree
-from .sdf import compute_sdf_and_knots
+from .geometry import constrained_recursive_pca, flatten_pca_tree
+from .fields import compute_sdf_warp
+from .simplification import simplify_sdf_to_knots_batch
+from .types import Spline
+from .network import create_mlp
+from .train_optimized import train_model_optimized, update_spline_predictions
 
 
 @click.command()
@@ -22,7 +26,13 @@ from .sdf import compute_sdf_and_knots
 @click.option('--max-depth', type=int, default=3, help='Maximum PCA recursion depth')
 @click.option('--exact/--no-exact', default=True, 
               help='Use exact distance computation (slower, more accurate) vs KNN approximation (faster)')
-def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact):
+@click.option('--no-compile', is_flag=True, default=False,
+              help='Disable torch.compile (enabled by default)')
+@click.option('--precision', type=click.Choice(['fp32', 'bfloat16', 'fp16']), default='fp32',
+              help='Training precision (fp32, bfloat16, fp16)')
+@click.option('--warp-device', type=int, default=0,
+              help='CUDA device ID for Warp SDF computation')
+def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact, no_compile, precision, warp_device):
     """Unified training command for 2D and 3D."""
     
     # ========================================
@@ -36,8 +46,11 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
         input_dim = 3
     
     click.echo(f"\n{'='*60}")
-    click.echo(f"Neural Spline Training - {dim.upper()}")
+    click.echo(f"Neural Spline Training - {dim.upper()} (OPTIMIZED)")
     click.echo(f"Model: {model}")
+    click.echo(f"Precision: {precision}")
+    click.echo(f"torch.compile: {'Disabled' if no_compile else 'Enabled'}")
+    click.echo(f"Warp Device: cuda:{warp_device}")
     click.echo(f"{'='*60}\n")
     
     # ========================================
@@ -116,17 +129,18 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
         }
     
     # ========================================
-    # 4. Recursive PCA Decomposition
+    # 4. Constrained Recursive PCA Decomposition (Optimized)
     # ========================================
-    click.echo(f"\nPerforming recursive PCA decomposition...")
+    click.echo(f"\nPerforming constrained recursive PCA decomposition...")
     click.echo(f"  Input: {len(vertices)} vertices in {dim}")
+    click.echo(f"  Features: Mass-based orientation, degeneracy handling, slab clipping")
     
     # Use minimum of 3 points for subdivision
     min_points = 3
     
     click.echo(f"  Parameters: min_points={min_points}, max_depth={max_depth}")
     
-    pca_tree = recursive_pca_decomposition(
+    pca_tree = constrained_recursive_pca(
         vertices,
         min_points=min_points,
         max_depth=max_depth
@@ -170,7 +184,12 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
             'max_depth': max_depth
         },
         'sdf_config': {
-            'exact': exact
+            'exact': exact,
+            'warp_device': warp_device
+        },
+        'training_config': {
+            'precision': precision,
+            'use_compile': not no_compile
         },
         'timestamp': timestamp
     }
@@ -184,28 +203,34 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
     click.echo(f"\n✓ Configuration saved to {exp_dir / 'config.json'}")
     
     # ========================================
-    # 6. Compute SDF along Spline Components
+    # 6. Compute SDF using Warp (Optimized)
     # ========================================
     click.echo(f"\n{'='*60}")
-    click.echo(f"COMPUTING SDF ALONG SPLINE COMPONENTS")
+    click.echo(f"COMPUTING SDF USING NVIDIA WARP")
     click.echo(f"{'='*60}")
     
-    # Detect device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    click.echo(f"Using device: {device.upper()}")
+    # Compute SDF using Warp kernels
+    click.echo(f"\nProcessing {len(components)} components with Warp...")
     
-    # Compute SDF and knots
-    click.echo(f"\nProcessing {len(components)} components...")
-    
-    (t_values_list, sdf_values_list,
-     knot_t_list, knot_sdf_list,
-     max_errors, mean_errors) = compute_sdf_and_knots(
+    t_values_list, sdf_values_list = compute_sdf_warp(
         components=components,
         data=data,
         n_samples_per_unit=1000,
+        device_id=warp_device
+    )
+    
+    # ========================================
+    # 7. Simplify to Knots using Numba (Optimized)
+    # ========================================
+    click.echo(f"\n{'='*60}")
+    click.echo(f"SIMPLIFYING TO KNOTS USING NUMBA")
+    click.echo(f"{'='*60}")
+    
+    knot_t_list, knot_sdf_list, max_errors, mean_errors = simplify_sdf_to_knots_batch(
+        t_values_list=t_values_list,
+        sdf_values_list=sdf_values_list,
         tolerance=0.005,
-        device=device,
-        exact=exact
+        linear_tolerance_factor=10.0
     )
     
     # Print statistics
@@ -222,25 +247,91 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
     click.echo(f"  Max error:         {max_error:.6f}")
     
     # ========================================
-    # 7. Summary
+    # 8. Create Splines for Training
+    # ========================================
+    click.echo(f"\n{'='*60}")
+    click.echo(f"CREATING SPLINE OBJECTS")
+    click.echo(f"{'='*60}")
+    
+    # Detect device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    click.echo(f"Using device: {device.upper()}")
+    
+    splines = []
+    for comp, gt_t, gt_v in zip(components, knot_t_list, knot_sdf_list):
+        spline = Spline(
+            start_point=comp.start,
+            end_point=comp.end,
+            gt_knots=gt_t,
+            gt_values=gt_v,
+            label=comp.label,
+            depth=comp.depth,
+            pc_type=f"pc{comp.component_idx + 1}",
+            component_idx=comp.component_idx
+        )
+        splines.append(spline)
+    
+    click.echo(f"✓ Created {len(splines)} splines for training")
+    
+    # ========================================
+    # 9. Train Model (Optimized)
+    # ========================================
+    click.echo(f"\n{'='*60}")
+    click.echo(f"TRAINING NEURAL NETWORK (OPTIMIZED)")
+    click.echo(f"{'='*60}")
+    
+    # Create model
+    mlp = create_mlp(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        use_bfloat16=(precision == 'bfloat16'),
+        device=device
+    )
+    
+    click.echo(f"\nModel Summary:")
+    click.echo(mlp.summary())
+    
+    # Train
+    use_compile = not no_compile
+    loss_history = train_model_optimized(
+        mlp=mlp,
+        splines=splines,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        clip_grad_norm=1.0,
+        save_path=exp_dir,
+        use_compile=use_compile,
+        precision=precision
+    )
+    
+    # Save loss history
+    np.save(exp_dir / 'loss_history.npy', np.array(loss_history))
+    
+    # Update predictions
+    click.echo(f"\nUpdating spline predictions...")
+    update_spline_predictions(mlp, splines, use_compile=use_compile)
+    
+    # ========================================
+    # 10. Summary
     # ========================================
     actual_max_depth = max(comp.depth for comp in components)
     
     click.echo(f"\n{'='*60}")
-    click.echo(f"PIPELINE COMPLETE")
+    click.echo(f"PIPELINE COMPLETE (OPTIMIZED)")
     click.echo(f"{'='*60}")
-    click.echo(f"Dimension:     {dim}")
-    click.echo(f"Model:         {model}")
-    click.echo(f"Vertices:      {len(vertices):,}")
-    click.echo(f"Components:    {len(components)}")
-    click.echo(f"Max depth:     {actual_max_depth} (requested: {max_depth})")
-    click.echo(f"Knots:         {total_knots:,}")
-    click.echo(f"Compression:   {total_samples / total_knots:.1f}x")
-    click.echo(f"Experiment:    {exp_dir}")
-    click.echo(f"{'='*60}")
-    click.echo(f"\nNext steps:")
-    click.echo(f"  • Model training ({epochs} epochs)")
-    click.echo(f"  • Visualization and evaluation")
+    click.echo(f"Dimension:       {dim}")
+    click.echo(f"Model:           {model}")
+    click.echo(f"Vertices:        {len(vertices):,}")
+    click.echo(f"Components:      {len(components)}")
+    click.echo(f"Max depth:       {actual_max_depth} (requested: {max_depth})")
+    click.echo(f"Knots:           {total_knots:,}")
+    click.echo(f"Compression:     {total_samples / total_knots:.1f}x")
+    click.echo(f"Precision:       {precision}")
+    click.echo(f"torch.compile:   {'Enabled' if use_compile else 'Disabled'}")
+    click.echo(f"Final loss:      {loss_history[-1]:.6f}")
+    click.echo(f"Experiment:      {exp_dir}")
     click.echo(f"{'='*60}\n")
 
 

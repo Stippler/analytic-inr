@@ -22,5 +22,6 @@ git clone https://github.com/facebookresearch/pytorch3d.git
 cd pytorch3d
 pip install -e . --no-build-isolation
 pip install click matplotlib trimesh rtree
+pip install trame trame-vuetify trame-vtk
 ```
 
