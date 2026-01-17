@@ -1,337 +1,248 @@
-
 import click
 import numpy as np
 import torch
 import json
 from pathlib import Path
 from datetime import datetime
-import matplotlib.pyplot as plt
+from pytorch3d.io import load_ply
 
 from .polygons import generate_polygons
-from .preprocess import preprocess_polygons_to_splines
-from .spline import Spline
-from .model import ReluMLP
-from .train import train_model, reset_predictions, compute_metrics
-from .train_fast import train_model_fast, update_spline_predictions
-from .metrics import compute_sdf_metrics, print_metrics
-from .vis import plot_sdf_heatmap, plot_splines, plot_splines_3d, extract_mesh_from_mlp_3d
+from .pca import recursive_pca_decomposition, flatten_pca_tree
+from .sdf import compute_sdf_and_knots
 
 
-@click.group()
-def cli():
-    """Neural Spline Training CLI - Train on 2D or 3D data."""
-    pass
-
-
-@cli.command()
-@click.option('--dataset', type=click.Choice(['simple', 'hard'], case_sensitive=False), 
-              default='simple', help='Dataset: simple (convex) or hard (non-convex star polygons)')
-@click.option('--epochs', type=int, default=1000, help='Number of training epochs')
-@click.option('--hidden-dim', type=int, default=16, help='Hidden dimension of the MLP')
-@click.option('--num-layers', type=int, default=3, help='Number of hidden layers')
-@click.option('--batch-size', type=int, default=8, help='Batch size for training')
-@click.option('--lr', type=float, default=0.01, help='Learning rate')
-@click.option('--save/--no-save', default=True, help='Save experiment results')
-@click.option('--fast/--no-fast', default=False, help='Use fast batched training implementation')
-def train_2d(dataset, epochs, hidden_dim, num_layers, batch_size, lr, save, fast):
-    """Train on 2D polygon datasets."""
-    input_dim = 2
-    
-    # Setup experiment directory
-    if save:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_dir = Path('data') / 'experiments' / f'{input_dim}d' / timestamp
-        exp_dir.mkdir(parents=True, exist_ok=True)
-        click.echo(f"Saving to: {exp_dir}")
-    else:
-        exp_dir = None
-    
-    # Generate polygons
-    if dataset.lower() == 'simple':
-        polygons = generate_polygons('1x16', convex=True)
-    else:
-        polygons = generate_polygons('3x16', convex=False, stretch=(1, 0.5), 
-                                    star_ratio=0.9, rotation=[np.pi/4, -np.pi/3, np.pi/5])
-    
-    # Preprocess to splines
-    all_knots, hierarchy = preprocess_polygons_to_splines(polygons, max_depth=2, 
-                                                           n_samples=1000, tolerance=0.005)
-    
-    splines = []
-    for knot_data in all_knots:
-        p_start, p_end = knot_data['line']
-        splines.append(Spline(
-            start_point=torch.tensor(p_start, dtype=torch.float32),
-            end_point=torch.tensor(p_end, dtype=torch.float32),
-            pred_values=None, pred_knots=None,
-            gt_knots=torch.tensor(knot_data['knot_t'], dtype=torch.float32),
-            gt_values=torch.tensor(knot_data['knot_sdf'], dtype=torch.float32),
-            label=knot_data['label'], depth=knot_data['depth'], pc_type=knot_data['pc_type']
-        ))
-    
-    # Create and train model
-    torch.manual_seed(0)
-    mlp = ReluMLP(input_dim, hidden_dim, num_layers, skip_connections=False)
-    n_params = sum(p.numel() for p in mlp.parameters())
-    
-    mode_str = "FAST" if fast else "Original"
-    click.echo(f"Training {dataset} ({mode_str}) | {n_params} params | {len(splines)} splines | {epochs} epochs")
-    
-    if fast:
-        # Use fast batched training
-        # Increase batch size for fast mode if using default
-        loss_history = train_model_fast(mlp, splines, epochs=epochs, batch_size=batch_size, 
-                                       lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
-        # Update predictions for metrics
-        update_spline_predictions(mlp, splines)
-    else:
-        # Use original training
-        loss_history = train_model(mlp, splines, epochs=epochs, batch_size=batch_size, 
-                                   lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
-        # Compute metrics
-        reset_predictions(mlp, splines)
-    spline_metrics = compute_metrics(splines)
-    sdf_metrics = compute_sdf_metrics(mlp, polygons, n_samples=10000, bbox_min=-1.0, bbox_max=1.0)
-    
-    click.echo(f"\nResults: MAE={sdf_metrics['mae']:.6f} | IoU={sdf_metrics['iou_interior']:.4f} | "
-               f"Sign Acc={sdf_metrics['sign_accuracy']:.4f}")
-    
-    if save:
-        # Save plots
-        plot_sdf_heatmap(mlp, splines=splines, polygons=polygons, resolution=300,
-                        title="Learned SDF", save_path=exp_dir / 'sdf_heatmap.png')
-        plot_splines(splines, save_path=exp_dir / 'spline_predictions.png')
-        
-        # Loss curve
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(loss_history, linewidth=2)
-        ax.set_xlabel('Epoch'); ax.set_ylabel('Loss')
-        ax.set_title('Training Loss'); ax.grid(alpha=0.3); ax.set_yscale('log')
-        plt.tight_layout()
-        fig.savefig(exp_dir / 'loss_curve.png', dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        
-        # Save final model and data
-        torch.save({'model_state_dict': mlp.state_dict(), 'input_dim': input_dim,
-                   'hidden_dim': hidden_dim, 'num_layers': num_layers}, exp_dir / 'final_model.pt')
-        
-        with open(exp_dir / 'config.json', 'w') as f:
-            json.dump({'dataset': dataset, 'input_dim': input_dim, 'epochs': epochs,
-                      'hidden_dim': hidden_dim, 'num_layers': num_layers, 'batch_size': batch_size,
-                      'lr': lr, 'n_params': n_params, 'n_splines': len(splines),
-                      'n_polygons': len(polygons)}, f, indent=2)
-        
-        with open(exp_dir / 'metrics.json', 'w') as f:
-            json.dump({'spline_metrics': spline_metrics, 'sdf_metrics': sdf_metrics,
-                      'final_loss': float(loss_history[-1])}, f, indent=2)
-        
-        np.save(exp_dir / 'loss_history.npy', np.array(loss_history))
-        
-        click.echo(f"Saved to: {exp_dir}")
-    else:
-        # Show plots if not saving
-        plot_sdf_heatmap(mlp, splines=splines, polygons=polygons, resolution=300, title="Learned SDF")
-        plot_splines(splines)
-
-
-@cli.command()
-@click.option('--model-name', type=str, default='Armadillo.ply', help='Model filename')
+@click.command()
+@click.option('--model', type=str, default='Armadillo',
+              help='Model name. For 2D: simple/hard. For 3D: mesh name (e.g., Armadillo)')
 @click.option('--epochs', type=int, default=1000, help='Number of training epochs')
 @click.option('--hidden-dim', type=int, default=32, help='Hidden dimension of the MLP')
 @click.option('--num-layers', type=int, default=4, help='Number of hidden layers')
 @click.option('--batch-size', type=int, default=8, help='Batch size for training')
 @click.option('--lr', type=float, default=0.01, help='Learning rate')
-@click.option('--save/--no-save', default=True, help='Save experiment results')
-@click.option('--fast/--no-fast', default=False, help='Use fast batched training implementation')
-def train_3d(model_name, epochs, hidden_dim, num_layers, batch_size, lr, save, fast):
-    """Train on 3D mesh datasets."""
-    import trimesh
+@click.option('--max-depth', type=int, default=3, help='Maximum PCA recursion depth')
+@click.option('--exact/--no-exact', default=True, 
+              help='Use exact distance computation (slower, more accurate) vs KNN approximation (faster)')
+def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact):
+    """Unified training command for 2D and 3D."""
     
-    input_dim = 3
-    mesh_path = Path('data') / 'meshes' / model_name
+    # ========================================
+    # 1. Infer dimension from model name
+    # ========================================
+    if model.lower() in ['simple', 'hard']:
+        dim = '2d'
+        input_dim = 2
+    else:
+        dim = '3d'
+        input_dim = 3
     
-    if not mesh_path.exists():
-        click.echo(f"Error: Mesh not found at {mesh_path}", err=True)
+    click.echo(f"\n{'='*60}")
+    click.echo(f"Neural Spline Training - {dim.upper()}")
+    click.echo(f"Model: {model}")
+    click.echo(f"{'='*60}\n")
+    
+    # ========================================
+    # 2. Setup Experiment Directory
+    # ========================================
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    exp_dir = Path('data') / 'experiments' / dim / timestamp
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    click.echo(f"Experiment directory: {exp_dir}")
+    
+    # ========================================
+    # 3. Load Data
+    # ========================================
+    click.echo(f"\nLoading {dim} data...")
+    
+    if dim == '2d':
+        # Generate 2D polygons
+        if model.lower() == 'simple':
+            click.echo("  Generating simple convex polygons...")
+            polygons = generate_polygons('1x16', convex=True)
+        elif model.lower() == 'hard':
+            click.echo("  Generating hard non-convex polygons...")
+            polygons = generate_polygons('3x16', convex=False, stretch=(1, 0.5), 
+                                         star_ratio=0.9, rotation=[np.pi/4, -np.pi/3, np.pi/5])
+        else:
+            click.echo(f"ERROR: Unknown model '{model}'. Use 'simple' or 'hard' for 2D, or a mesh name for 3D", err=True)
+            return
+        
+        # Extract vertices from polygons and convert to tensor
+        vertices_np = np.concatenate(polygons, axis=0)
+        vertices = torch.from_numpy(vertices_np).float()
+        click.echo(f"  Total vertices: {len(vertices)}")
+        data = {'type': '2d', 'polygons': polygons, 'vertices': vertices}
+        
+    else:  # 3d
+        # Load 3D mesh using PyTorch3D
+        mesh_path = Path('data') / 'meshes' / f'{model}.ply'
+        
+        if not mesh_path.exists():
+            # Try alternate location
+            mesh_path = Path('data') / 'stanford' / f'{model}.ply'
+            if not mesh_path.exists():
+                click.echo(f"ERROR: Mesh not found: {model}.ply in data/meshes/ or data/stanford/", err=True)
+                return
+        
+        click.echo(f"  Loading mesh from: {mesh_path}")
+        verts, faces = load_ply(str(mesh_path))
+    
+        click.echo(f"  Vertices: {len(verts)}, Faces: {len(faces)}")
+        
+        # Normalize mesh to [-1, 1] with padding (keep as tensor)
+        padding = 0.1
+        centroid = verts.mean(dim=0)
+        verts = verts - centroid
+        
+        # Compute extents
+        min_coords = verts.min(dim=0)[0]
+        max_coords = verts.max(dim=0)[0]
+        extents = max_coords - min_coords
+        max_extent = extents.max().item()
+        
+        if max_extent > 0:
+            scale = 2.0 * (1.0 - padding) / max_extent
+            verts = verts * scale
+        
+        bounds = torch.stack([verts.min(dim=0)[0], verts.max(dim=0)[0]], dim=1)
+        click.echo(f"  Normalized bounds:")
+        click.echo(f"    {bounds.T}")
+        
+        vertices = verts
+        data = {
+            'type': '3d',
+            'verts': verts,
+            'faces': faces,
+            'vertices': vertices
+        }
+    
+    # ========================================
+    # 4. Recursive PCA Decomposition
+    # ========================================
+    click.echo(f"\nPerforming recursive PCA decomposition...")
+    click.echo(f"  Input: {len(vertices)} vertices in {dim}")
+    
+    # Use minimum of 3 points for subdivision
+    min_points = 3
+    
+    click.echo(f"  Parameters: min_points={min_points}, max_depth={max_depth}")
+    
+    pca_tree = recursive_pca_decomposition(
+        vertices,
+        min_points=min_points,
+        max_depth=max_depth
+    )
+    
+    if pca_tree is None:
+        click.echo("ERROR: PCA decomposition failed (insufficient points)", err=True)
         return
     
-    # Setup experiment directory
-    if save:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        exp_dir = Path('data') / 'experiments' / f'{input_dim}d' / timestamp
-        exp_dir.mkdir(parents=True, exist_ok=True)
-        click.echo(f"Saving to: {exp_dir}")
-    else:
-        exp_dir = None
+    # Extract all components
+    components = flatten_pca_tree(pca_tree)
+    click.echo(f"  ✓ Generated {len(components)} PCA components")
     
-    # Load and normalize mesh
-    click.echo("Loading mesh...")
-    mesh = trimesh.load(str(mesh_path), force='mesh')
-    click.echo(f"  Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+    # Print component breakdown
+    by_depth = {}
+    by_type = {}
+    for comp in components:
+        by_depth[comp.depth] = by_depth.get(comp.depth, 0) + 1
+        pc_type = f"PC{comp.component_idx + 1}"
+        by_type[pc_type] = by_type.get(pc_type, 0) + 1
     
-    padding = 0.1
-    mesh.vertices -= mesh.centroid
-    max_extent = np.max(mesh.extents)
-    if max_extent > 0:
-        scale = 2.0 * (1.0 - padding) / max_extent
-        mesh.vertices *= scale
-    click.echo(f"  Normalized bounds: {mesh.bounds.T}")
+    click.echo(f"\n  Components by depth: {dict(sorted(by_depth.items()))}")
+    click.echo(f"  Components by type: {dict(sorted(by_type.items()))}")
     
-    # Use mesh vertices directly for PCA (no sampling bias)
-    click.echo("Using mesh vertices for PCA...")
-    surface_points = mesh.vertices.copy()
-    click.echo(f"  Using {len(surface_points)} vertices")
+    # ========================================
+    # 5. Save Configuration
+    # ========================================
+    config = {
+        'dimension': dim,
+        'input_dim': input_dim,
+        'model': model,
+        'epochs': epochs,
+        'hidden_dim': hidden_dim,
+        'num_layers': num_layers,
+        'batch_size': batch_size,
+        'lr': lr,
+        'n_vertices': len(vertices),
+        'n_components': len(components),
+        'pca_config': {
+            'min_points': min_points,
+            'max_depth': max_depth
+        },
+        'sdf_config': {
+            'exact': exact
+        },
+        'timestamp': timestamp
+    }
     
-    # Preprocess using hierarchical PCA (works for 3D too)
-    from .preprocess import build_hierarchical_pca, extract_all_lines, compute_sdf_sampling_3d
+    if dim == '3d':
+        config['n_faces'] = len(data['faces'])
     
-    click.echo("Building hierarchical PCA decomposition...")
-    hierarchy = build_hierarchical_pca(surface_points, max_depth=2, box_min=-1, box_max=1)
-    all_lines_data = extract_all_lines(hierarchy)
-    line_segments = [line for line, _ in all_lines_data]
-    labels = [label for _, label in all_lines_data]
-    click.echo(f"  Generated {len(line_segments)} line segments")
+    with open(exp_dir / 'config.json', 'w') as f:
+        json.dump(config, f, indent=2)
     
-    # Compute SDF along each line using trimesh (GPU-accelerated if available)
-    click.echo("Computing SDF along lines and simplifying to knots...")
+    click.echo(f"\n✓ Configuration saved to {exp_dir / 'config.json'}")
+    
+    # ========================================
+    # 6. Compute SDF along Spline Components
+    # ========================================
+    click.echo(f"\n{'='*60}")
+    click.echo(f"COMPUTING SDF ALONG SPLINE COMPONENTS")
+    click.echo(f"{'='*60}")
+    
+    # Detect device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if device == 'cuda':
-        click.echo(f"  Using GPU-accelerated SDF computation")
-    all_knots = []
-    from .preprocess import simplify_sdf_to_knots
+    click.echo(f"Using device: {device.upper()}")
     
-    for idx, ((p_start, p_end), label) in enumerate(zip(line_segments, labels)):
-        if idx % 10 == 0:
-            click.echo(f"  Processing line {idx+1}/{len(line_segments)}...")
-        
-        # Compute SDF with high resolution sampling (verbose on first iteration)
-        t, sdf = compute_sdf_sampling_3d(p_start, p_end, mesh, n_samples=1000, device=device, verbose=(idx==0))
-        
-        # Simplify to knots
-        knot_t, knot_sdf, max_err, mean_err = simplify_sdf_to_knots(t, sdf, tolerance=0.005)
-        
-        depth = int(label.split(':')[0].replace('D', '')) if 'D' in label else 0
-        pc_type = 'pc1' if 'pc1' in label else ('pc2' if 'pc2' in label else 'pc3')
-        
-        all_knots.append({
-            't': t, 'sdf': sdf,
-            'knot_t': knot_t, 'knot_sdf': knot_sdf,
-            'max_error': max_err, 'mean_error': mean_err,
-            'label': label, 'line': (p_start, p_end),
-            'depth': depth, 'pc_type': pc_type
-        })
+    # Compute SDF and knots
+    click.echo(f"\nProcessing {len(components)} components...")
     
-    click.echo(f"  Generated {len(all_knots)} splines with knots")
+    (t_values_list, sdf_values_list,
+     knot_t_list, knot_sdf_list,
+     max_errors, mean_errors) = compute_sdf_and_knots(
+        components=components,
+        data=data,
+        n_samples_per_unit=1000,
+        tolerance=0.005,
+        device=device,
+        exact=exact
+    )
     
-    # Convert to Spline objects
-    click.echo("Converting to Spline objects...")
-    splines = []
-    for knot_data in all_knots:
-        p_start, p_end = knot_data['line']
-        splines.append(Spline(
-            start_point=torch.tensor(p_start, dtype=torch.float32),
-            end_point=torch.tensor(p_end, dtype=torch.float32),
-            pred_values=None, pred_knots=None,
-            gt_knots=torch.tensor(knot_data['knot_t'], dtype=torch.float32),
-            gt_values=torch.tensor(knot_data['knot_sdf'], dtype=torch.float32),
-            label=knot_data['label'], depth=knot_data['depth'], pc_type=knot_data['pc_type']
-        ))
+    # Print statistics
+    total_samples = sum(len(t) for t in t_values_list)
+    total_knots = sum(len(t) for t in knot_t_list)
+    avg_error = mean_errors.mean().item()
+    max_error = max_errors.max().item()
     
-    # Create and train model
-    click.echo("Creating model...")
-    torch.manual_seed(0)
-    mlp = ReluMLP(input_dim, hidden_dim, num_layers, skip_connections=False)
-    n_params = sum(p.numel() for p in mlp.parameters())
+    click.echo(f"\n✓ SDF Computation Complete:")
+    click.echo(f"  Total samples:     {total_samples:,}")
+    click.echo(f"  Total knots:       {total_knots:,}")
+    click.echo(f"  Compression ratio: {total_samples / total_knots:.1f}x")
+    click.echo(f"  Mean error:        {avg_error:.6f}")
+    click.echo(f"  Max error:         {max_error:.6f}")
     
-    # Check GPU availability and move model/data to GPU
-    if torch.cuda.is_available():
-        click.echo(f"✓ CUDA available: {torch.cuda.get_device_name(0)}")
-        click.echo(f"✓ Moving model to GPU...")
-        mlp = mlp.cuda()
-        # Move splines to GPU
-        for spline in splines:
-            spline.start_point = spline.start_point.cuda()
-            spline.end_point = spline.end_point.cuda()
-            spline.gt_knots = spline.gt_knots.cuda()
-            spline.gt_values = spline.gt_values.cuda()
-        click.echo(f"✓ Model and data moved to GPU")
-    else:
-        click.echo("⚠ CUDA not available, using CPU")
+    # ========================================
+    # 7. Summary
+    # ========================================
+    actual_max_depth = max(comp.depth for comp in components)
     
-    mode_str = "FAST" if fast else "Original"
-    click.echo(f"Training {dataset}/{model_name} ({mode_str}) | {n_params} params | {len(splines)} splines | {epochs} epochs")
-    click.echo("Starting training...")
-    
-    if fast:
-        # Use fast batched training
-        # Increase batch size for fast mode if using default
-        fast_batch_size = max(batch_size, 64) if batch_size == 8 else batch_size
-        loss_history = train_model_fast(mlp, splines, epochs=epochs, batch_size=fast_batch_size,
-                                       lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
-        # Update predictions for metrics
-        click.echo("\nUpdating spline predictions...")
-        update_spline_predictions(mlp, splines)
-    else:
-        # Use original training
-        loss_history = train_model(mlp, splines, epochs=epochs, batch_size=batch_size,
-                                   lr=lr, clip_grad_norm=1.0, save_path=exp_dir if save else None)
-        # Compute metrics
-        click.echo("\nComputing spline metrics...")
-        reset_predictions(mlp, splines)
-    spline_metrics = compute_metrics(splines)
-    
-    # Compute 3D SDF metrics
-    click.echo("Computing 3D SDF metrics...")
-    from .metrics import compute_sdf_metrics_3d
-    sdf_metrics = compute_sdf_metrics_3d(mlp, mesh, n_samples=10000, bbox_min=-1.0, bbox_max=1.0)
-    
-    click.echo(f"\nResults: MAE={sdf_metrics['mae']:.6f} | IoU={sdf_metrics['iou_interior']:.4f} | "
-               f"Sign Acc={sdf_metrics['sign_accuracy']:.4f}")
-    
-    # Extract and save predicted mesh using marching cubes
-    predicted_mesh = None
-    if save:
-        click.echo("\nExtracting predicted mesh using marching cubes...")
-        predicted_mesh = extract_mesh_from_mlp_3d(mlp, resolution=64, bbox_min=-1.0, bbox_max=1.0)
-    
-    if save:
-        click.echo("Saving results...")
-        # Loss curve
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(loss_history, linewidth=2)
-        ax.set_xlabel('Epoch'); ax.set_ylabel('Loss')
-        ax.set_title('Training Loss'); ax.grid(alpha=0.3); ax.set_yscale('log')
-        plt.tight_layout()
-        fig.savefig(exp_dir / 'loss_curve.png', dpi=150, bbox_inches='tight')
-        plt.close(fig)
-        
-        # Save final model and data
-        torch.save({'model_state_dict': mlp.state_dict(), 'input_dim': input_dim,
-                   'hidden_dim': hidden_dim, 'num_layers': num_layers}, exp_dir / 'final_model.pt')
-        
-        with open(exp_dir / 'config.json', 'w') as f:
-            json.dump({'dataset': dataset, 'model_name': model_name, 'input_dim': input_dim,
-                      'epochs': epochs, 'hidden_dim': hidden_dim, 'num_layers': num_layers,
-                      'batch_size': batch_size, 'lr': lr, 'n_params': n_params,
-                      'n_splines': len(splines), 'n_vertices': len(mesh.vertices),
-                      'n_faces': len(mesh.faces)}, f, indent=2)
-        
-        with open(exp_dir / 'metrics.json', 'w') as f:
-            json.dump({'spline_metrics': spline_metrics, 'sdf_metrics': sdf_metrics,
-                      'final_loss': float(loss_history[-1])}, f, indent=2)
-        
-        np.save(exp_dir / 'loss_history.npy', np.array(loss_history))
-        
-        # Plot and save 3D splines
-        click.echo("Plotting 3D splines...")
-        plot_splines_3d(splines, save_path=exp_dir / 'spline_predictions.png')
-        
-        # Save extracted mesh
-        if predicted_mesh is not None:
-            click.echo("Saving predicted mesh...")
-            predicted_mesh.export(exp_dir / 'predicted_mesh.ply')
-        
-        click.echo(f"Saved to: {exp_dir}")
+    click.echo(f"\n{'='*60}")
+    click.echo(f"PIPELINE COMPLETE")
+    click.echo(f"{'='*60}")
+    click.echo(f"Dimension:     {dim}")
+    click.echo(f"Model:         {model}")
+    click.echo(f"Vertices:      {len(vertices):,}")
+    click.echo(f"Components:    {len(components)}")
+    click.echo(f"Max depth:     {actual_max_depth} (requested: {max_depth})")
+    click.echo(f"Knots:         {total_knots:,}")
+    click.echo(f"Compression:   {total_samples / total_knots:.1f}x")
+    click.echo(f"Experiment:    {exp_dir}")
+    click.echo(f"{'='*60}")
+    click.echo(f"\nNext steps:")
+    click.echo(f"  • Model training ({epochs} epochs)")
+    click.echo(f"  • Visualization and evaluation")
+    click.echo(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-    cli()
+    main()

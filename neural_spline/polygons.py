@@ -1,7 +1,3 @@
-"""
-2D polygon generation for testing and benchmarking.
-"""
-
 from typing import List
 import numpy as np
 
