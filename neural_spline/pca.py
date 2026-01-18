@@ -2,6 +2,8 @@ import torch
 from typing import List, Tuple, Optional
 from dataclasses import dataclass, field
 
+import trimesh
+
 
 @dataclass
 class PCAComponent:
@@ -12,7 +14,6 @@ class PCAComponent:
     component_idx: int  # Which PC this is (0=PC1, 1=PC2, etc.)
     depth: int
     label: str
-
 
 @dataclass
 class PCANode:

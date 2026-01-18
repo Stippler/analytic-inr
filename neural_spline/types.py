@@ -164,6 +164,7 @@ class Spline:
         end_point: (D,) End point in space
         gt_knots: (M,) Ground truth knot positions in [0, 1]
         gt_values: (M,) Ground truth SDF values at knots
+        normals: (M,D) Surface normals at gt_knots (optional)
         pred_knots: (N,) Predicted knot positions (populated during training)
         pred_values: (N,) Predicted SDF values at knots
         label: Human-readable label for visualization
@@ -175,6 +176,7 @@ class Spline:
     end_point: torch.Tensor        # (D,)
     gt_knots: torch.Tensor         # (M,)
     gt_values: torch.Tensor        # (M,)
+    normals: Optional[torch.Tensor] = None      # (M,D) - normals at gt_knots
     pred_knots: Optional[torch.Tensor] = None   # (N,) - filled during training
     pred_values: Optional[torch.Tensor] = None  # (N,)
     label: str = ""
@@ -222,7 +224,7 @@ class PCANode:
 
 
 def create_bounding_box_polytope(bbox_min: float = -1.0, bbox_max: float = 1.0, 
-                                  dimension: int = 3) -> ConvexPolytope:
+                                  dimension: int = 3, device: torch.device = torch.device("cuda")) -> ConvexPolytope:
     """
     Create a ConvexPolytope representing an axis-aligned bounding box.
     
@@ -241,18 +243,29 @@ def create_bounding_box_polytope(bbox_min: float = -1.0, bbox_max: float = 1.0,
     
     for i in range(dimension):
         # Lower bound: -x_i <= -bbox_min  =>  x_i >= bbox_min
-        normal_lower = torch.zeros(dimension)
+        normal_lower = torch.zeros(dimension, device=device)
         normal_lower[i] = -1.0
         normals_list.append(normal_lower)
         offsets_list.append(-bbox_min)
         
         # Upper bound: x_i <= bbox_max
-        normal_upper = torch.zeros(dimension)
+        normal_upper = torch.zeros(dimension, device=device)
         normal_upper[i] = 1.0
         normals_list.append(normal_upper)
         offsets_list.append(bbox_max)
     
     normals = torch.stack(normals_list, dim=0)  # (2*D, D)
-    offsets = torch.tensor(offsets_list)  # (2*D,)
+    offsets = torch.tensor(offsets_list, device=device)  # (2*D,)
     
     return ConvexPolytope(normals, offsets, dimension)
+
+
+@dataclass
+class Splines:
+    start_points: torch.Tensor
+    end_points: torch.Tensor
+
+    knots: torch.Tensor
+    values: torch.Tensor
+
+    normals: torch.Tensor

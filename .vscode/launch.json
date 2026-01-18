@@ -5,11 +5,17 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "Python Debugger: Neural Spline",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "neural_spline.main"
+        },
+        {
             "name": "Python Debugger: Demo",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/demo.py",
             "console": "integratedTerminal"
-        }
+        },
     ]
 }

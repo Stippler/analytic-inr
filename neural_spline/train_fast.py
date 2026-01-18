@@ -9,12 +9,13 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from tqdm import tqdm
 from torch.nn.utils.rnn import pad_sequence
+from torch.profiler import profile, record_function, ProfilerActivity
 
-from .spline import Spline
-from .model import ReluMLP
+from neural_spline.types import Splines
+from neural_spline.model import ReluMLP
 
 
 # ==========================================
@@ -87,8 +88,8 @@ def reset_predictions_tensor_mode(mlp: nn.Module, p0: torch.Tensor, p1: torch.Te
     layers = list(mlp.layers)
     
     # --- Initialize: t=0 and t=1 for all batches ---
-    t_start = torch.zeros(B, device=device)
-    t_end = torch.ones(B, device=device)
+    t_start = torch.zeros(B, device=device, dtype=p0.dtype)
+    t_end = torch.ones(B, device=device, dtype=p0.dtype)
     
     t_flat = torch.stack([t_start, t_end], dim=1).reshape(-1)  # (2B,)
     batch_ids = torch.arange(B, device=device).repeat_interleave(2)  # (2B,)
@@ -117,6 +118,7 @@ def reset_predictions_tensor_mode(mlp: nn.Module, p0: torch.Tensor, p1: torch.Te
         # Mask: Valid segment if batch_ids[i] == batch_ids[i+1]
         if len(batch_ids) > 1:
             mask_seg = batch_ids[:-1] == batch_ids[1:]
+            # True True True True False True True True True True False
             
             if mask_seg.any():
                 z_L = z_flat[:-1][mask_seg]  # (N_segs, D_out)
@@ -265,47 +267,22 @@ def batch_exact_integral_loss(pred_t, pred_v, gt_t, gt_v):
     # Sum over all segments (dim 1) then sum over batch (dim 0)
     return segment_areas.sum()
 
-
-# ==========================================
-# 3. Data Collation
-# ==========================================
-
-def collate_splines(splines: List[Spline], device) -> Dict[str, torch.Tensor]:
-    """
-    Converts List[Spline] to Dict of Padded Tensors.
-    
-    Args:
-        splines: List of Spline objects
-        device: Device to move tensors to
-    
-    Returns:
-        Dictionary with keys 'p0', 'p1', 'gt_t', 'gt_v'
-    """
-    # Start/End points
-    p0 = torch.stack([s.start_point for s in splines]).to(device)
-    p1 = torch.stack([s.end_point for s in splines]).to(device)
-    
-    # GT Data (Pad t with 1.0, v with 0.0)
-    gt_t_list = [s.gt_knots.to(device) for s in splines]
-    gt_v_list = [s.gt_values.to(device) for s in splines]
-    
-    gt_t_pad = pad_sequence(gt_t_list, batch_first=True, padding_value=1.0)
-    gt_v_pad = pad_sequence(gt_v_list, batch_first=True, padding_value=0.0)
-    
-    return {'p0': p0, 'p1': p1, 'gt_t': gt_t_pad, 'gt_v': gt_v_pad}
-
-
 # ==========================================
 # 4. Optimized Training Loop
 # ==========================================
 
 def train_model_fast(mlp: ReluMLP,
-                     splines: List[Spline],
+                     splines: Splines,
                      epochs: int = 1000,
                      batch_size: int = 64,
                      lr: float = 0.01,
                      clip_grad_norm: float = 1.0,
-                     save_path=None):
+                     save_path=None,
+                     profile_enabled: bool = False,
+                     profile_wait: int = 1,
+                     profile_warmup: int = 1,
+                     profile_active: int = 3,
+                     profile_repeat: int = 1):
     """
     Fast, batched training loop for neural spline learning.
     
@@ -314,18 +291,23 @@ def train_model_fast(mlp: ReluMLP,
     
     Args:
         mlp: The neural network to train
-        splines: List of Spline objects with ground truth data
+        splines: Splines with ground truth data
         epochs: Number of training epochs
         batch_size: Batch size for training
         lr: Learning rate
         clip_grad_norm: Maximum gradient norm for clipping
         save_path: Optional path to save best model checkpoint
+        profile_enabled: Enable PyTorch profiler
+        profile_wait: Number of steps to wait before profiling
+        profile_warmup: Number of warmup steps
+        profile_active: Number of steps to profile
+        profile_repeat: Number of times to repeat the profiling cycle
     
     Returns:
         loss_history: List of average loss per epoch
     """
     # Determine device from first spline
-    device = splines[0].start_point.device
+    device = splines.start_points.device
     mlp = mlp.to(device)
     
     # GPU Diagnostic
@@ -339,80 +321,146 @@ def train_model_fast(mlp: ReluMLP,
         print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
         print(f"CUDA memory cached: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
     print(f"Model device: {next(mlp.parameters()).device}")
-    print(f"Spline data device: {splines[0].start_point.device}")
+    print(f"Spline data device: {splines.start_points.device}")
     print("="*60 + "\n")
     
     optimizer = optim.Adam(mlp.parameters(), lr=lr)
     
-    # 1. Pre-process Data Once
-    print("Collating spline data...")
-    data = collate_splines(splines, device)
-    N = len(splines)
+    N = splines.start_points.shape[0]
     print(f"Training on {N} splines with batch size {batch_size}")
     
     loss_history = []
     best_loss = float('inf')
     best_epoch = 0
     
+    # Setup profiler if enabled
+    prof_context = None
+    if profile_enabled:
+        print("\n" + "="*60)
+        print("PROFILER ENABLED")
+        print("="*60)
+        print(f"Wait steps: {profile_wait}")
+        print(f"Warmup steps: {profile_warmup}")
+        print(f"Active steps: {profile_active}")
+        print(f"Repeat: {profile_repeat}")
+        
+        activities = [ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(ProfilerActivity.CUDA)
+            print("Profiling both CPU and CUDA")
+        else:
+            print("Profiling CPU only")
+        print("="*60 + "\n")
+        
+        prof_context = profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(
+                wait=profile_wait,
+                warmup=profile_warmup,
+                active=profile_active,
+                repeat=profile_repeat
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+    
     pbar = tqdm(range(epochs))
-    for epoch in pbar:
-        # GPU diagnostic on first epoch
-        if epoch == 0 and torch.cuda.is_available():
-            print(f"\n[Epoch 0] GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB allocated")
-        # Shuffle indices
-        perm = torch.randperm(N, device=device)
-        
-        epoch_loss = 0.0
-        n_batches = 0
-        
-        for i in range(0, N, batch_size):
-            batch_end = min(i + batch_size, N)
-            idx = perm[i:batch_end]
+    
+    # Start profiler context if enabled
+    if prof_context is not None:
+        prof_context.__enter__()
+    
+    try:
+        for epoch in pbar:
+            # GPU diagnostic on first epoch
+            if epoch == 0 and torch.cuda.is_available():
+                print(f"\n[Epoch 0] GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB allocated")
+            # Shuffle indices
+            # TODO: add flag
+            perm = torch.randperm(N, device=device)
             
-            # Slice Batch
-            p0 = data['p0'][idx]
-            p1 = data['p1'][idx]
-            gt_t = data['gt_t'][idx]
-            gt_v = data['gt_v'][idx]
+            epoch_loss = 0.0
+            n_batches = 0
             
-            optimizer.zero_grad()
-            
-            # A. Vectorized Prediction
-            pred_t, pred_v = reset_predictions_tensor_mode(mlp, p0, p1)
-            
-            # B. Vectorized Loss
-            loss_sum = batch_exact_integral_loss(pred_t, pred_v, gt_t, gt_v)
-            loss_mean = loss_sum / len(idx)
-            
-            loss_mean.backward()
-            torch.nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad_norm)
-            optimizer.step()
-            
-            epoch_loss += loss_mean.item()
-            n_batches += 1
-            
-        avg_loss = epoch_loss / n_batches if n_batches > 0 else 0
-        loss_history.append(avg_loss)
-        
-        # Save best
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_epoch = epoch
-            if save_path:
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': mlp.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': best_loss,
-                }, save_path / 'best_model_fast.pt')
+
+            for batch_idx in perm.chunk(batch_size):
+                with record_function("batch_iteration"):
+                    # Slice Batch
+                    with record_function("data_slicing"):
+                        p0 = splines.start_points[batch_idx]
+                        p1 = splines.end_points[batch_idx]
+                        gt_t = splines.knots[batch_idx]
+                        gt_v = splines.values[batch_idx]
+                    
+                    with record_function("optimizer_zero_grad"):
+                        optimizer.zero_grad()
+                    
+                    # A. Vectorized Prediction
+                    with record_function("forward_pass"):
+                        pred_t, pred_v = reset_predictions_tensor_mode(mlp, p0, p1)
+                    
+                    # B. Vectorized Loss
+                    with record_function("loss_computation"):
+                        loss_sum = batch_exact_integral_loss(pred_t, pred_v, gt_t, gt_v)
+                        loss_mean = loss_sum / len(batch_idx)
+                    
+                    with record_function("backward_pass"):
+                        loss_mean.backward()
+                    
+                    with record_function("gradient_clipping"):
+                        torch.nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad_norm)
+                    
+                    with record_function("optimizer_step"):
+                        optimizer.step()
+                    
+                    epoch_loss += loss_mean.item()
+                    n_batches += 1
                 
-        pbar.set_postfix({'loss': f"{avg_loss:.6f}", 'best': f"{best_loss:.6f}"})
+                # Step profiler if enabled
+                if prof_context is not None:
+                    prof_context.step()
+                
+            avg_loss = epoch_loss / n_batches if n_batches > 0 else 0
+            loss_history.append(avg_loss)
+            
+            # Save best
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                best_epoch = epoch
+                if save_path:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': mlp.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': best_loss,
+                    }, save_path / 'best_model_fast.pt')
+                    
+            pbar.set_postfix({'loss': f"{avg_loss:.6f}", 'best': f"{best_loss:.6f}"})
+    
+    finally:
+        # Clean up profiler
+        if prof_context is not None:
+            prof_context.__exit__(None, None, None)
+            print("\n" + "="*60)
+            print("PROFILING COMPLETE")
+            print("="*60)
+            print("Trace saved to: ./profiler_logs")
+            print("\nTo view the results, run:")
+            print("  tensorboard --logdir=./profiler_logs")
+            print("\nKey stats:")
+            print(prof_context.key_averages().table(
+                sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total",
+                row_limit=20
+            ))
+            print("="*60 + "\n")
 
     print(f"\nTraining complete! Best loss: {best_loss:.6f} at epoch {best_epoch}")
     return loss_history
 
 
-def update_spline_predictions(mlp: ReluMLP, splines: List[Spline]):
+def update_spline_predictions(mlp: ReluMLP, splines: Splines):
     """
     Update all splines with final predictions from the trained model.
     

@@ -1,6 +1,153 @@
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import numpy as np
+import torch
 import trimesh
+from pathlib import Path
+from pytorch3d.structures import Meshes
+from pytorch3d.ops import sample_points_from_meshes
+
+
+def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
+    """
+    Load mesh data for 2D or 3D models.
+    
+    Parameters:
+    -----------
+    model : str
+        Model name. For 2D: 'simple' or 'hard'. For 3D: mesh filename (e.g., 'Armadillo')
+    dim : str
+        Dimension: '2d' or '3d'
+    
+    Returns:
+    --------
+    dict or None
+        Dictionary containing:
+        - 'type': '2d' or '3d'
+        - 'mesh': trimesh.Trimesh object
+        - 'vertices': torch.Tensor of shape (N, 3)
+        - 'faces': torch.Tensor of shape (F, 3)
+        
+        Returns None on error (with error messages printed)
+    """
+    from .polygons import generate_polygons
+    
+    if dim == '2d':
+        # Generate 2D polygons
+        if model.lower() == "simple":
+            print("  Generating simple convex polygons...")
+            polygons_2d = generate_polygons("1x16", convex=True)
+        elif model.lower() == "hard":
+            print("  Generating hard non-convex polygons...")
+            polygons_2d = generate_polygons(
+                "3x16",
+                convex=False,
+                stretch=(1, 0.5),
+                star_ratio=0.9,
+                rotation=[np.pi / 4, -np.pi / 3, np.pi / 5],
+            )
+        else:
+            print(f"ERROR: Unknown model '{model}'. Use 'simple' or 'hard' for 2D, or a mesh name for 3D")
+            return None
+
+        # ------------------------------------------------------------
+        # Extrude polygons into a thin 3D triangle mesh
+        # ------------------------------------------------------------
+        thickness = 1e-3  # small but non-zero (ray-tracing safe)
+        meshes = []
+
+        for poly in polygons_2d:
+            # Ensure CCW order
+            poly = np.asarray(poly, dtype=np.float64)
+
+            prism = trimesh.creation.extrude_polygon(
+                polygon=trimesh.path.polygons.polygon.Polygon(poly),
+                height=thickness,
+            )
+
+            # Center extrusion around z = 0
+            prism.vertices[:, 2] -= thickness * 0.5
+            meshes.append(prism)
+
+        # Merge all prisms into one mesh
+        mesh = trimesh.util.concatenate(meshes)
+
+        # Optional cleanup (safe)
+        mesh.remove_duplicate_faces()
+        mesh.remove_unreferenced_vertices()
+        mesh.process(validate=True)
+
+        print(f"  Mesh vertices: {len(mesh.vertices)}, faces: {len(mesh.faces)}")
+
+        # Torch tensors (from mesh)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        verts = torch.from_numpy(mesh.vertices).float().to(device)
+        faces = torch.from_numpy(mesh.faces).long().to(device)
+
+        data = {
+            "type": "2d",
+            "mesh": mesh,        # for ray tracing
+            "vertices": verts,   # for PCA
+            "faces": faces,
+        }
+
+        return data
+        
+    else:  # 3d
+        # Locate mesh
+        mesh_path = Path("data") / "meshes" / f"{model}.ply"
+        if not mesh_path.exists():
+            mesh_path = Path("data") / "stanford" / f"{model}.ply"
+            if not mesh_path.exists():
+                print(f"ERROR: Mesh not found: {model}.ply in data/meshes/ or data/stanford/")
+                return None
+
+        print(f"  Loading mesh from: {mesh_path}")
+
+        # Load mesh exactly as-is
+        mesh = trimesh.load(mesh_path, process=False)
+        if not isinstance(mesh, trimesh.Trimesh):
+            print("ERROR: Loaded object is not a triangle mesh")
+            return None
+
+        print(f"  Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+
+        # ------------------------------------------------------------------
+        # Normalize mesh to [-1, 1] with padding (APPLY TO TRIMESH ITSELF)
+        # ------------------------------------------------------------------
+        padding = 0.1
+
+        verts_np = mesh.vertices.astype("float32")
+
+        centroid = verts_np.mean(axis=0)
+        verts_np = verts_np - centroid
+
+        min_coords = verts_np.min(axis=0)
+        max_coords = verts_np.max(axis=0)
+        extents = max_coords - min_coords
+        max_extent = extents.max()
+
+        if max_extent > 0:
+            scale = 2.0 * (1.0 - padding) / max_extent
+            verts_np = verts_np * scale
+
+        # Write back to trimesh
+        mesh.vertices = verts_np
+
+        # ------------------------------------------------------------------
+        # Create torch tensors FROM the normalized mesh
+        # ------------------------------------------------------------------
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        verts = torch.from_numpy(mesh.vertices).float().to(device)
+        faces = torch.from_numpy(mesh.faces).long().to(device)
+        data = {
+            'type': '3d',
+            'mesh': mesh,
+            'vertices': verts,
+            'faces': faces,
+        }
+        
+        return data
+
 
 def create_polygons2d(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0), rotation=0.0) -> List[np.ndarray]:
     """
@@ -156,92 +303,4 @@ def create_polygons2d(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0), rot
         polygons.append(vertices)
     
     return polygons
-
-
-def load_mesh(mesh_path: str, padding: float = 0.1):
-    """
-    Load mesh and normalize to fit in [-1, 1]^3 with padding.
-    Returns mesh and SDF function.
-    """
-    mesh = trimesh.load(mesh_path, force='mesh')
-    
-    # Center and scale to fit in [-1+padding, 1-padding]^3
-    mesh.vertices -= mesh.centroid
-    max_extent = np.max(mesh.extents)
-    if max_extent > 0:
-        scale = 2.0 * (1.0 - padding) / max_extent
-        mesh.vertices *= scale
-    
-    # Create SDF function using pysdf (fast, vectorized)
-    sdf_fn = pysdf.SDF(mesh.vertices.astype(np.float32), mesh.faces.astype(np.int32))
-    
-    return mesh, sdf_fn
-
-
-def query_sdf_along_line(sdf_fn, line_start: np.ndarray, line_end: np.ndarray, num_samples: int = 1000):
-    """
-    Compute signed distance along a line. Vectorized for efficiency.
-    
-    For very large num_samples (10k+), this is much faster than individual queries.
-    pysdf handles batched queries efficiently using BVH acceleration.
-    
-    Returns (t_vals, sdf_vals) where t_vals are in [0, 1].
-    
-    Note: This samples uniformly. For adaptive sampling near surface, use
-    query_sdf_along_line_adaptive() instead.
-    """
-    line_start = np.asarray(line_start, dtype=np.float32).reshape(3)
-    line_end = np.asarray(line_end, dtype=np.float32).reshape(3)
-    t_vals = np.linspace(0, 1, num_samples, dtype=np.float32)
-    points = line_start[None, :] + t_vals[:, None] * (line_end - line_start)[None, :]
-    sdf_vals = sdf_fn(points)
-    return t_vals, sdf_vals
-
-
-def query_sdf_along_line_adaptive(sdf_fn, line_start: np.ndarray, line_end: np.ndarray, 
-                                   num_coarse: int = 100, num_fine: int = 1000, 
-                                   surface_threshold: float = 0.1):
-    """
-    Adaptive sampling: dense near surface, sparse elsewhere.
-    
-    First samples coarsely, identifies regions near surface (|SDF| < threshold),
-    then samples densely in those regions.
-    
-    Returns (t_vals, sdf_vals) with non-uniform t spacing.
-    """
-    line_start = np.asarray(line_start, dtype=np.float32).reshape(3)
-    line_end = np.asarray(line_end, dtype=np.float32).reshape(3)
-    
-    # Coarse pass
-    t_coarse = np.linspace(0, 1, num_coarse, dtype=np.float32)
-    points_coarse = line_start[None, :] + t_coarse[:, None] * (line_end - line_start)[None, :]
-    sdf_coarse = sdf_fn(points_coarse)
-    
-    # Find intervals near surface
-    near_surface = np.abs(sdf_coarse) < surface_threshold
-    
-    if not np.any(near_surface):
-        # No surface nearby, return coarse
-        return t_coarse, sdf_coarse
-    
-    # Find contiguous regions near surface
-    t_vals_list = []
-    for i in range(len(t_coarse) - 1):
-        if near_surface[i] or near_surface[i + 1]:
-            # Dense sampling in this interval
-            n_dense = max(10, num_fine // np.sum(near_surface))
-            t_dense = np.linspace(t_coarse[i], t_coarse[i + 1], n_dense, endpoint=False)
-            t_vals_list.append(t_dense)
-        else:
-            # Keep coarse sample
-            t_vals_list.append(np.array([t_coarse[i]]))
-    
-    t_vals_list.append(np.array([t_coarse[-1]]))  # Last point
-    t_vals = np.concatenate(t_vals_list)
-    
-    # Compute SDF at all points
-    points = line_start[None, :] + t_vals[:, None] * (line_end - line_start)[None, :]
-    sdf_vals = sdf_fn(points)
-    
-    return t_vals, sdf_vals
 
