@@ -86,3 +86,20 @@ class ReluMLP(nn.Module):
         
         return output, preacts
 
+    def config(self):
+        return {
+            "input_dim": self.input_dim,
+            "hidden_dim": self.hidden_dim,
+            "num_layers": self.num_layers,
+            "skip_connections": self.skip_connections,
+        }
+    
+    @staticmethod
+    def restore_from_config(config):
+        mlp = ReluMLP(
+            input_dim=config["input_dim"],
+            hidden_dim=config["hidden_dim"],
+            num_layers=config["num_layers"],
+            skip_connections=config["skip_connections"],
+        )
+        return mlp

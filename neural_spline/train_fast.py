@@ -400,6 +400,7 @@ def train_model_fast(mlp: ReluMLP,
             if save_path:
                 torch.save({
                     'epoch': epoch,
+                    'config': mlp.config(),
                     'model_state_dict': mlp.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'loss': best_loss,
