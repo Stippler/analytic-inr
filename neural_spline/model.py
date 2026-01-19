@@ -32,16 +32,22 @@ class ReluMLP(nn.Module):
     
     def forward(self, x):
         """Forward pass through the network."""
-        h = x
+        # First layer
+        h = torch.relu(self.layers[0](x))
         
-        # All layers except last
-        for layer in self.layers[:-1]:
-            h = torch.relu(layer(h))
+        # Hidden layers (with skip connections if enabled)
+        for layer in self.layers[1:-1]:
+            if self.skip_connections:
+                # Concatenate input to hidden state
+                h_input = torch.cat([h, x], dim=-1)
+            else:
+                h_input = h
+            h = torch.relu(layer(h_input))
         
         # Output layer (no activation)
-        h = self.layers[-1](h)
+        output = self.layers[-1](h)
         
-        return h
+        return output
     
     def eval_activations(self, x):
         """
@@ -56,12 +62,19 @@ class ReluMLP(nn.Module):
             output: (N, 1) network output
             preactivations: (N, num_layers, hidden_dim) pre-activation values
         """
-        h = x
-        preacts = []
+        # First layer
+        h_pre = self.layers[0](x)
+        preacts = [h_pre]
+        h = torch.relu(h_pre)
         
-        # All layers except last
-        for layer in self.layers[:-1]:
-            h_pre = layer(h)
+        # Hidden layers (with skip connections if enabled)
+        for layer in self.layers[1:-1]:
+            if self.skip_connections:
+                # Concatenate input to hidden state
+                h_input = torch.cat([h, x], dim=-1)
+            else:
+                h_input = h
+            h_pre = layer(h_input)
             preacts.append(h_pre)
             h = torch.relu(h_pre)
         

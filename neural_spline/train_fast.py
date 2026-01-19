@@ -12,67 +12,87 @@ def insert_zero_crossings(t: torch.Tensor,
                           z: torch.Tensor,
                           max_knots: int,
                           eps: float = 1e-6):
+    """
+    Optimized version using segment-wise sorting + stable compaction.
+    Exploits the fact that t is already sorted and new knots belong to specific segments.
+    """
     device = t.device
     B, K = t.shape
     H = z.shape[-1]
 
     # Adjacent segments
-    tL, tR = t[:, :-1], t[:, 1:]             # (B, K-1)
-    zL, zR = z[:, :-1, :], z[:, 1:, :]       # (B, K-1, H)
-    seg_valid = valid[:, :-1] & valid[:, 1:] # (B, K-1)
+    tL, tR = t[:, :-1], t[:, 1:]                 # (B, K-1)
+    zL, zR = z[:, :-1, :], z[:, 1:, :]           # (B, K-1, H)
+    seg_valid = valid[:, :-1] & valid[:, 1:]     # (B, K-1)
 
-    denom = (zR - zL)
+    # alpha for each (segment, neuron)
+    denom = (zR - zL)                             # (B, K-1, H)
     denom_valid = denom.abs() > eps
     denom_safe = torch.where(denom_valid, denom, torch.ones_like(denom))
-    alpha = (-zL) / denom_safe
+    alpha = (-zL) / denom_safe                    # (B, K-1, H)
 
-    is_cross = seg_valid[:, :, None] & denom_valid & (alpha > eps) & (alpha < 1.0 - eps)
+    valid_new = seg_valid[:, :, None] & denom_valid & (alpha > eps) & (alpha < 1.0 - eps)
 
-    # Flatten candidates
-    M = (K - 1) * H
-    alpha_f = alpha.reshape(B, M)            # (B, M)
-    valid_new = is_cross.reshape(B, M)       # (B, M) bool
+    # candidate times in each segment (B, K-1, H)
+    dt = (tR - tL)                                # (B, K-1)
+    t_new = tL[:, :, None] + alpha * dt[:, :, None]
 
-    seg_idx_base = torch.arange(K - 1, device=device).repeat_interleave(H)  # (M,)
-    seg_idx = seg_idx_base[None, :].expand(B, -1)                           # (B, M)
-
-    tL_f = torch.gather(tL, 1, seg_idx)
-    tR_f = torch.gather(tR, 1, seg_idx)
-
-    alpha_f = torch.where(valid_new, alpha_f, torch.zeros_like(alpha_f))
-    t_new = tL_f + alpha_f * (tR_f - tL_f)      # (B, M)
-
-    # Interpolate full z-vector at t_new
-    seg_idx_3 = seg_idx.unsqueeze(-1).expand(-1, -1, H)
-    zL_c = torch.gather(zL, 1, seg_idx_3)
-    zR_c = torch.gather(zR, 1, seg_idx_3)
-
-    z_new = zL_c + alpha_f.unsqueeze(-1) * (zR_c - zL_c)
-    z_new = z_new * valid_new.unsqueeze(-1)
-
-    # Merge + sort + truncate
-    BIG = t.new_tensor(2.0)  # invalid => goes to end
-
-    t_old_eff = torch.where(valid, t, BIG)
+    BIG = t.new_tensor(2.0)
     t_new_eff = torch.where(valid_new, t_new, BIG)
 
-    t_all = torch.cat([t_old_eff, t_new_eff], dim=1)        # (B, K+M)
-    z_all = torch.cat([z, z_new], dim=1)                    # (B, K+M, H)
-    v_all = torch.cat([valid, valid_new], dim=1)            # (B, K+M)
+    # candidate z-vectors: (B, K-1, H_cand, H_vec)
+    z_new = zL[:, :, None, :] + alpha[:, :, :, None] * (zR - zL)[:, :, None, :]
+    z_new = torch.where(valid_new[:, :, :, None], z_new, torch.zeros_like(z_new))
 
-    t_sorted, idx = torch.sort(t_all, dim=1)
-    idx_z = idx.unsqueeze(-1).expand(-1, -1, H)
-    z_sorted = torch.gather(z_all, 1, idx_z)
-    v_sorted = torch.gather(v_all, 1, idx)
+    # Sort candidates within each segment (O(H log H) per segment instead of O(KH log KH) globally)
+    t_sorted, idx = torch.sort(t_new_eff, dim=2)  # (B, K-1, H)
+    idx_z = idx.unsqueeze(-1).expand(-1, -1, -1, H)  # (B, K-1, H, H)
+    z_sorted = torch.gather(z_new, 2, idx_z)         # (B, K-1, H, H)
+    v_sorted = torch.gather(valid_new, 2, idx)       # (B, K-1, H)
 
-    t2 = t_sorted[:, :max_knots].contiguous()
-    z2 = z_sorted[:, :max_knots].contiguous()
-    valid2 = v_sorted[:, :max_knots].contiguous()
+    # Interleave: [t[i], candidates(seg i)] for i=0..K-2, then append t[K-1]
+    t_old = t[:, :-1].unsqueeze(-1)                   # (B, K-1, 1)
+    z_old = z[:, :-1].unsqueeze(2)                    # (B, K-1, 1, H)
+    v_old = valid[:, :-1].unsqueeze(-1)               # (B, K-1, 1)
 
-    t2 = torch.where(valid2, t2, t2.new_tensor(1.0))
-    z2 = torch.where(valid2.unsqueeze(-1), z2, torch.zeros_like(z2))
+    t_seg = torch.cat([t_old, t_sorted], dim=2)       # (B, K-1, 1+H)
+    z_seg = torch.cat([z_old, z_sorted], dim=2)       # (B, K-1, 1+H, H)
+    v_seg = torch.cat([v_old, v_sorted], dim=2)       # (B, K-1, 1+H)
 
-    return t2, valid2, z2
+    t_all = t_seg.reshape(B, (K-1) * (1 + H))
+    z_all = z_seg.reshape(B, (K-1) * (1 + H), H)
+    v_all = v_seg.reshape(B, (K-1) * (1 + H))
+
+    t_all = torch.cat([t_all, t[:, -1:]], dim=1)      # (B, Nall)
+    z_all = torch.cat([z_all, z[:, -1:, :]], dim=1)   # (B, Nall, H)
+    v_all = torch.cat([v_all, valid[:, -1:]], dim=1)  # (B, Nall)
+
+    # STABLE COMPACTION: keep first max_knots valid entries per row, preserving order
+    v_int = v_all.to(torch.int64)
+    pos = torch.cumsum(v_int, dim=1) - 1               # target positions for valid entries
+    keep = v_all & (pos < max_knots)
+
+    idx_out = torch.where(keep, pos, torch.zeros_like(pos)).to(torch.int64)
+
+    # scatter_add is safe because for keep==True, pos are unique within each row
+    t_out = torch.zeros((B, max_knots), device=device, dtype=t.dtype)
+    t_src = torch.where(keep, t_all, torch.zeros_like(t_all))
+    t_out = t_out.scatter_add(1, idx_out, t_src)
+
+    z_out = torch.zeros((B, max_knots, H), device=device, dtype=z.dtype)
+    z_src = torch.where(keep.unsqueeze(-1), z_all, torch.zeros_like(z_all))
+    z_out = z_out.scatter_add(1, idx_out.unsqueeze(-1).expand(-1, -1, H), z_src)
+
+    v_out_i = torch.zeros((B, max_knots), device=device, dtype=torch.int64)
+    v_out_i = v_out_i.scatter_add(1, idx_out, keep.to(torch.int64))
+    v_out = v_out_i > 0
+
+    # normalize padding
+    t_out = torch.where(v_out, t_out, t_out.new_tensor(1.0))
+    z_out = torch.where(v_out.unsqueeze(-1), z_out, torch.zeros_like(z_out))
+
+    return t_out, v_out, z_out
+
 
 def forward_knots(mlp: nn.Module, end_points: torch.Tensor, start_points: torch.Tensor,
                   max_knots=64, eps=1e-6):
@@ -195,7 +215,7 @@ def train_model_fast(mlp: ReluMLP,
                      clip_grad_norm: float = 1.0,
                      save_path=None,
                      extract_mesh: bool = False,
-                     mesh_resolution: int = 128,
+                     mesh_resolution: int = 256,
                      mesh_save_interval: int = 50):
     device = splines.start_points.device
     mlp = mlp.to(device)
@@ -208,7 +228,8 @@ def train_model_fast(mlp: ReluMLP,
 
     pbar = tqdm(range(epochs))
     
-    knot_fwd = KnotForward(mlp, max_knots=32, eps=1e-6).to(device)
+    max_knots = 32
+    knot_fwd = KnotForward(mlp, max_knots=max_knots, eps=1e-6).to(device)
 
     knot_fwd = torch.compile(
         knot_fwd,
@@ -225,6 +246,7 @@ def train_model_fast(mlp: ReluMLP,
 
         epoch_loss = 0.0
         n_batches = 0
+        epoch_knot_counts = []
 
         for i in range(0, N, batch_size):
             batch_idx = perm[i:i + batch_size]
@@ -234,9 +256,13 @@ def train_model_fast(mlp: ReluMLP,
             knots_gt = splines.knots[batch_idx]
             values_gt = splines.values[batch_idx]
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             pred_t, pred_valid, pred_y = knot_fwd(p1, p0)
+
+            # Track knot statistics
+            knot_counts = pred_valid.sum(dim=1).cpu()  # (B,) - number of valid knots per sample
+            epoch_knot_counts.append(knot_counts)
 
             loss_sum = compiled_loss(pred_t, pred_y, knots_gt, values_gt, pred_valid)
             loss_mean = loss_sum / batch_idx.numel()
@@ -252,6 +278,17 @@ def train_model_fast(mlp: ReluMLP,
 
         avg_loss = epoch_loss / max(n_batches, 1)
         loss_history.append(avg_loss)
+        
+        # Compute knot statistics for this epoch
+        all_knot_counts = torch.cat(epoch_knot_counts)
+        knot_min = all_knot_counts.min().item()
+        knot_max = all_knot_counts.max().item()
+        knot_mean = all_knot_counts.float().mean().item()
+        knot_median = all_knot_counts.float().median().item()
+        knot_std = all_knot_counts.float().std().item()
+        knot_q25 = all_knot_counts.float().quantile(0.25).item()
+        knot_q75 = all_knot_counts.float().quantile(0.75).item()
+        knot_saturation = (all_knot_counts >= max_knots).float().mean().item() * 100  # % hitting max_knots limit
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -270,7 +307,33 @@ def train_model_fast(mlp: ReluMLP,
             except Exception as e:
                 print(f"Error extracting mesh: {e}")
 
-        pbar.set_postfix({'loss': f"{avg_loss:.6f}", 'best': f"{best_loss:.6f}"})
+        pbar.set_postfix({
+            'loss': f"{avg_loss:.6f}", 
+            'best': f"{best_loss:.6f}",
+            'knots': f"μ={knot_mean:.1f}±{knot_std:.1f} [{knot_min:.0f},{knot_median:.0f},{knot_max:.0f}]",
+            'sat': f"{knot_saturation:.1f}%"
+        })
+        
+        # Print detailed statistics every 50 epochs
+        if epoch % 50 == 0 or epoch == epochs - 1:
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch} - Detailed Knot Statistics")
+            print(f"{'='*60}")
+            print(f"  Min / Q25 / Median / Q75 / Max: {knot_min:.0f} / {knot_q25:.0f} / {knot_median:.0f} / {knot_q75:.0f} / {knot_max:.0f}")
+            print(f"  Mean ± Std: {knot_mean:.2f} ± {knot_std:.2f}")
+            print(f"  Saturation (at max_knots={max_knots}): {knot_saturation:.1f}%")
+            print(f"\n  Distribution:")
+            bins = [0, 8, 16, 24, 32, float('inf')]
+            bin_labels = ['0-7', '8-15', '16-23', '24-31', '32+']
+            for i in range(len(bins)-1):
+                if bins[i+1] == float('inf'):
+                    count = (all_knot_counts >= bins[i]).sum().item()
+                else:
+                    count = ((all_knot_counts >= bins[i]) & (all_knot_counts < bins[i+1])).sum().item()
+                pct = count / len(all_knot_counts) * 100
+                bar = '█' * int(pct / 2)  # Scale for display
+                print(f"    {bin_labels[i]:>6s}: {pct:5.1f}% {bar}")
+            print(f"{'='*60}\n")
 
     # Save final mesh at the end of training
     if extract_mesh and save_path:

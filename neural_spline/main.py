@@ -14,14 +14,16 @@ from .utils import load_mesh_data
 @click.option('--epochs', type=int, default=1000)
 @click.option('--hidden-dim', type=int, default=64)
 @click.option('--num-layers', type=int, default=4)
-@click.option('--batch-size', type=int, default=8192)
+@click.option('--batch-size', type=int, default=2048)
 @click.option('--lr', type=float, default=0.01)
-@click.option('--max-depth', type=int, default=6)
+@click.option('--max-depth', type=int, default=5)
 @click.option('--use-knn/--no-use-knn', default=True)
 @click.option('--extract-mesh/--no-extract-mesh', default=True)
-@click.option('--mesh-resolution', type=int, default=128)
+@click.option('--mesh-resolution', type=int, default=256)
 @click.option('--save-dir', type=str, default=None)
-def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_knn, extract_mesh, mesh_resolution, save_dir):
+@click.option('--mesh-save-interval', type=int, default=50)
+@click.option('--skip-connections/--no-skip-connections', default=False)
+def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_knn, extract_mesh, mesh_resolution, save_dir, mesh_save_interval, skip_connections):
     if model.lower() in ['simple', 'hard']:
         dim = '2d'
         input_dim = 2
@@ -51,7 +53,7 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         num_layers=num_layers,
-        # skip_connections=True,
+        skip_connections=skip_connections,
     )
 
     total_params = sum(p.numel() for p in mlp.parameters())
@@ -79,6 +81,7 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
         save_path=output_path,
         extract_mesh=extract_mesh and dim == '3d',
         mesh_resolution=mesh_resolution,
+        mesh_save_interval=mesh_save_interval,
     )
 
 

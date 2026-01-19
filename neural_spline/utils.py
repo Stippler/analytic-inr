@@ -306,9 +306,9 @@ def create_polygons2d(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0), rot
     return polygons
 
 
-def extract_mesh_marching_cubes(model, save_path: Optional[Path] = None, resolution: int = 128, device=None):
+def extract_mesh_marching_cubes(model, save_path: Optional[Path] = None, resolution: int = 128, device=None, batch_size: int = 100000):
     """
-    Extract 3D mesh from implicit model using marching cubes.
+    Extract 3D mesh from implicit model using marching cubes with batched evaluation.
     
     Parameters:
     -----------
@@ -320,6 +320,8 @@ def extract_mesh_marching_cubes(model, save_path: Optional[Path] = None, resolut
         Grid resolution for marching cubes (default: 128)
     device : torch.device, optional
         Device to run evaluation on
+    batch_size : int
+        Number of points to evaluate at once (default: 100000)
     
     Returns:
     --------
@@ -335,11 +337,18 @@ def extract_mesh_marching_cubes(model, save_path: Optional[Path] = None, resolut
     X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
     
     grid_points = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
-    grid_tensor = torch.from_numpy(grid_points).float().to(device)
+    total_points = grid_points.shape[0]
     
+    # Evaluate in batches to avoid OOM
+    sdf_values = []
     with torch.no_grad():
-        sdf_values = model(grid_tensor).squeeze().cpu().numpy()
+        for i in range(0, total_points, batch_size):
+            batch = grid_points[i:i + batch_size]
+            batch_tensor = torch.from_numpy(batch).float().to(device)
+            batch_sdf = model(batch_tensor).squeeze().cpu().numpy()
+            sdf_values.append(batch_sdf)
     
+    sdf_values = np.concatenate(sdf_values)
     sdf_grid = sdf_values.reshape(resolution, resolution, resolution)
     
     vertices_mc, faces_mc, normals_mc, _ = measure.marching_cubes(
