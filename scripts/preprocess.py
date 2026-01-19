@@ -19,6 +19,8 @@ root_dir = Path(__file__).parent.parent
 def preprocess(mesh_name):
     n = 2 ** 24
     mesh_path = root_dir / "data" / "meshes" / f"{mesh_name}.ply"
+    pc_path = root_dir / "data" / "point_clouds"
+    pc_path.mkdir(exist_ok=True, parents=True)
     
     if not os.path.exists(mesh_path):
         raise FileNotFoundError(f"Mesh file {mesh_path} not found")
@@ -42,6 +44,27 @@ def preprocess(mesh_name):
         sdf_samples = scene.compute_signed_distance(o3d.core.Tensor.from_numpy(sdf_points), nsamples=9).numpy()
         points = np.concatenate([sdf_points, surface_points_on])
         dists = np.concatenate([sdf_samples, np.zeros(n_surface_on, dtype=np.float32)])
+        
+        N_SURF_POINTS = 100000
+        N_VOLUME_POINTS = 10000000
+        
+        # save a bunch of 3D points for the chamfer distance computation (on the surface)
+        surface_points = mesh.sample_points_uniformly(N_SURF_POINTS).point.positions.numpy()
+        surface_points_sdf = scene.compute_signed_distance(o3d.core.Tensor.from_numpy(surface_points), nsamples=9).numpy()
+        volume_points = np.random.rand(N_VOLUME_POINTS, 3).astype(np.float32) * 2 - 1
+        volume_points_sdf = scene.compute_signed_distance(o3d.core.Tensor.from_numpy(volume_points), nsamples=9).numpy()
+        
+        pcd_surf = o3d.t.geometry.PointCloud()
+        pcd_surf.point.positions = o3d.core.Tensor.from_numpy(surface_points)
+        pcd_surf.point.signed_distances = o3d.core.Tensor.from_numpy(surface_points_sdf[:, None])
+        
+        pcd_vol = o3d.t.geometry.PointCloud()
+        pcd_vol.point.positions = o3d.core.Tensor.from_numpy(volume_points)
+        pcd_vol.point.signed_distances = o3d.core.Tensor.from_numpy(volume_points_sdf[:, None])
+        
+        o3d.t.io.write_point_cloud(pc_path / f"{mesh_name}_surf.ply", pcd_surf)
+        o3d.t.io.write_point_cloud(pc_path / f"{mesh_name}_vol.ply", pcd_vol)
+        
     else:
         temp_path = Path(gettempdir(), f"marching_neurons_deep_sdf_preprocessor_{randint(0, 1000000000000)}.npz")
         cmd = [root_dir / "bin" / "PreprocessMesh", "-m", mesh_path, "-o", temp_path, "-s", str(n), "-b", "1.1"]
