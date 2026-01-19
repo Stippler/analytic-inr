@@ -219,3 +219,5 @@ data/*
 .vscode/settings.json
 profiler_logs/*
 outputs/*
+# point clouds (for sdf learning)
+nets/
