@@ -6,6 +6,7 @@ from pathlib import Path
 from pytorch3d.structures import Meshes
 from pytorch3d.ops import sample_points_from_meshes
 from skimage import measure
+import open3d as o3d
 
 
 def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
@@ -142,11 +143,28 @@ def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         verts = torch.from_numpy(mesh.vertices).float().to(device)
         faces = torch.from_numpy(mesh.faces).long().to(device)
+        
+        # also load volume/surface points
+        pcd_surf_path = Path("data") / "point_clouds" / f"{mesh_path.stem}_surf.ply"
+        assert pcd_surf_path.exists(), f"Surface point cloud not found: {pcd_surf_path}"
+        pcd_surf = o3d.t.io.read_point_cloud(pcd_surf_path)
+        surf_points = pcd_surf.point.positions.numpy()
+        
+        pcd_vol_path = Path("data") / "point_clouds" / f"{mesh_path.stem}_vol.ply"
+        assert pcd_vol_path.exists(), f"Surface point cloud not found: {pcd_vol_path}"
+        pcd_vol = o3d.t.io.read_point_cloud(pcd_surf_path)
+        vol_points = pcd_vol.point.positions.numpy()
+        vol_sdf = pcd_vol.point.signed_distances.numpy().squeeze()
+        
         data = {
             'type': '3d',
             'mesh': mesh,
             'vertices': verts,
             'faces': faces,
+            # these 3 are needed for evaluation
+            'pcd_surf': torch.tensor(surf_points).to(device),
+            'pcd_vol': torch.tensor(vol_points).to(device),
+            'pcd_vol_sdf': torch.tensor(vol_sdf).to(device),
         }
         
         return data

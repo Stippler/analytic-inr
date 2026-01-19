@@ -18,7 +18,7 @@ from geomloss import SamplesLoss
 from tqdm import tqdm
 
 from marching import arch as architectures
-from sdf_meshing import create_mesh
+# from sdf_meshing import create_mesh
 import trimesh
 
 root_dir = Path(__file__).parent.parent
@@ -30,6 +30,7 @@ torch.cuda.manual_seed(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
+from pytorch3d.loss import chamfer_distance
 
 def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
     """
@@ -130,6 +131,68 @@ def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
         "emd_loss": emd_loss_tensor.item()
     }
 
+def compute_IoU(data, model):
+    model.eval()
+    
+    assert "pcd_surf" in data , "pcd_surf are required"
+    
+    points_to_project = data["pcd_surf"]
+    gt_sdf = data["pcd_vol_sdf"]
+    
+    with torch.no_grad():
+        pred_sdf = model(points_to_project)
+    
+    pred_inside = (pred_sdf < 0).squeeze()
+    gt_inside = (gt_sdf < 0).squeeze()
+    
+    intersection = torch.logical_and(pred_inside, gt_inside).float().sum()
+    union = torch.logical_or(pred_inside, gt_inside).float().sum()
+
+    model.train()
+    
+    return intersection / union
+
+def compute_chamfer_distance(data, model):
+    model.eval()
+    
+    assert "pcd_vol" in data, "pcd_surf and pcd_vol are required"
+    assert "pcd_vol_sdf" in data, "pcd_vol_sdf is required"
+    
+    device = next(model.parameters()).device
+    
+    points_to_project = data["pcd_vol"]
+
+    # --- DIRECTION 2: NEURAL -> GT (Hard) ---
+    # 1. Project points to the neural zero-level set (Newton's method)
+    # We do 5-10 iterations to ensure they are exactly on the zero-isosurface
+    p_current = points_to_project
+    p_current.requires_grad_(True)
+    for _ in range(5):
+        sdf_val = model(p_current)
+        grad = torch.autograd.grad(
+            outputs=sdf_val, 
+            inputs=p_current, 
+            grad_outputs=torch.ones_like(sdf_val), 
+            create_graph=False, 
+            retain_graph=True
+        )[0]
+        
+        # Project: x_new = x - f(x) * n
+        # Normalize gradient to ensure stable step
+        grad_norm = torch.nn.functional.normalize(grad, dim=1)
+        p_current = p_current - sdf_val * grad_norm
+
+    # Now p_current lies on the neural surface (approx).
+    # We need the distance from these points to the REAL mesh.
+    # We use scipy cKDTree for fast nearest-neighbor search.
+    
+    cd, _ = chamfer_distance(p_current[None], data["pcd_surf"][None])
+    hd, _ = chamfer_distance(p_current[None], data["pcd_surf"][None], point_reduction="max")
+    
+    model.train()
+    
+    return cd, hd
+
 def eval(task_name, arch_name, mesh_name, sdf_path=None, save_mesh=True):
     # path is to get rid of the .ply extension
     try:
@@ -170,8 +233,8 @@ def eval(task_name, arch_name, mesh_name, sdf_path=None, save_mesh=True):
     with open(net_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=4)
         
-    if save_mesh:
-        create_mesh(net, net_dir / "mesh.ply", N=512)
+    # if save_mesh:
+    #     create_mesh(net, net_dir / "mesh.ply", N=512)
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Trains SDF neural networks from point clouds.")

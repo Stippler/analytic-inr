@@ -53,9 +53,6 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
     splines = compute_splines(data, components, 500_000, use_knn_method=use_knn)
     print(f"Computed {len(splines.start_points)} splines")
 
-    del data
-    torch.cuda.empty_cache()
-
     mlp = ReluMLP(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
@@ -92,6 +89,7 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
         collect_detailed_stats=detailed_stats,
         max_knots=max_knots,
         max_candidates_per_segment=max_candidates_per_segment,
+        data=data,
     )
 
 

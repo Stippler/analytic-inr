@@ -5,6 +5,7 @@ from tqdm import tqdm
 from neural_spline.types import Splines
 from neural_spline.model import ReluMLP
 from neural_spline.utils import extract_mesh_marching_cubes
+from scripts.evaluate import compute_chamfer_distance, compute_IoU
 torch.set_float32_matmul_precision('high')
 
 def insert_zero_crossings(t: torch.Tensor,
@@ -319,7 +320,8 @@ def train_model_fast(mlp: ReluMLP,
                      mesh_save_interval: int = 50,
                      collect_detailed_stats: bool = False,
                      max_knots: int = 32,
-                     max_candidates_per_segment: int = None):
+                     max_candidates_per_segment: int = None,
+                     data: dict = None):
     device = splines.start_points.device
     mlp = mlp.to(device)
 
@@ -383,6 +385,10 @@ def train_model_fast(mlp: ReluMLP,
 
         avg_loss = epoch_loss / max(n_batches, 1)
         loss_history.append(avg_loss)
+
+        # compute metrics based on the pcd_surf and pcd_vol
+        cd, hd = compute_chamfer_distance(data, mlp)
+        iou = compute_IoU(data, mlp)
         
         # Compute knot statistics for this epoch
         all_knot_counts = torch.cat(epoch_knot_counts)
@@ -417,7 +423,10 @@ def train_model_fast(mlp: ReluMLP,
             'loss': f"{avg_loss:.6f}", 
             'best': f"{best_loss:.6f}",
             'knots': f"μ={knot_mean:.1f}±{knot_std:.1f} [{knot_min:.0f},{knot_median:.0f},{knot_max:.0f}]",
-            'sat': f"{knot_saturation:.1f}%"
+            'sat': f"{knot_saturation:.1f}%",
+            'cd': f"{cd * 1e3:.4f}",
+            'hd': f"{hd * 1e3:.4f}",
+            'iou': f"{iou:.4f}"
         })
         
         # Print detailed statistics every 50 epochs
