@@ -140,3 +140,24 @@ as well as a mesh in `nets/from_sdf/relu_mlp_d4_w128/Stanford_armadillo/mesh.ply
 }
 ```
 </details>
+
+<details>
+<summary>How to eval our models</summary>
+
+In your `.pt`-file, you also need the model specification, which you can get by 
+`ReluMLP::config()`. It is now stored in the state dict.
+
+```json
+{
+    "name": "Eval: Ours",
+    "type": "debugpy",
+    "request": "launch",
+    "program": "${workspaceFolder}/scripts/evaluate.py",
+    "args": [
+        "--sdf_path", "outputs/Stanford_armadillo/20260119_110333/sdf_epoch_0000.pt",
+        "--mesh", "Stanford_armadillo",
+    ],
+    "console": "integratedTerminal"
+},
+```
+</details>
