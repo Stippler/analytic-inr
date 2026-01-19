@@ -16,9 +16,8 @@ from scipy.spatial import KDTree, cKDTree
 from neural_spline.model import ReluMLP
 from geomloss import SamplesLoss
 from tqdm import tqdm
-
+import numpy as np
 from marching import arch as architectures
-# from sdf_meshing import create_mesh
 import trimesh
 
 root_dir = Path(__file__).parent.parent
@@ -134,9 +133,9 @@ def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
 def compute_IoU(data, model):
     model.eval()
     
-    assert "pcd_surf" in data , "pcd_surf are required"
+    assert "pcd_vol" in data , "pcd_vol are required"
     
-    points_to_project = data["pcd_surf"]
+    points_to_project = data["pcd_vol"]
     gt_sdf = data["pcd_vol_sdf"]
     
     with torch.no_grad():
@@ -150,48 +149,115 @@ def compute_IoU(data, model):
 
     model.train()
     
-    return intersection / union
+    return intersection / (union + 1e-6)
 
 def compute_chamfer_distance(data, model):
     model.eval()
     
-    assert "pcd_vol" in data, "pcd_surf and pcd_vol are required"
-    assert "pcd_vol_sdf" in data, "pcd_vol_sdf is required"
+    assert "pcd_surf" in data, "pcd_surf is required"
     
     device = next(model.parameters()).device
     
-    points_to_project = data["pcd_vol"]
-
-    # --- DIRECTION 2: NEURAL -> GT (Hard) ---
-    # 1. Project points to the neural zero-level set (Newton's method)
-    # We do 5-10 iterations to ensure they are exactly on the zero-isosurface
-    p_current = points_to_project
-    p_current.requires_grad_(True)
-    for _ in range(5):
-        sdf_val = model(p_current)
-        grad = torch.autograd.grad(
-            outputs=sdf_val, 
-            inputs=p_current, 
-            grad_outputs=torch.ones_like(sdf_val), 
-            create_graph=False, 
-            retain_graph=True
-        )[0]
-        
-        # Project: x_new = x - f(x) * n
-        # Normalize gradient to ensure stable step
-        grad_norm = torch.nn.functional.normalize(grad, dim=1)
-        p_current = p_current - sdf_val * grad_norm
-
-    # Now p_current lies on the neural surface (approx).
-    # We need the distance from these points to the REAL mesh.
-    # We use scipy cKDTree for fast nearest-neighbor search.
+    # 1. Get points on the predicted surface using Newton's Method
+    p_current = data["pcd_surf"].to(device).detach().requires_grad_(True)
     
-    cd, _ = chamfer_distance(p_current[None], data["pcd_surf"][None])
-    hd, _ = chamfer_distance(p_current[None], data["pcd_surf"][None], point_reduction="max")
+    # We must enable grad for the projection even if in eval mode
+    with torch.enable_grad():
+        for _ in range(5):
+            sdf_val = model(p_current)
+            # Calculate gradient of SDF w.r.t. input points
+            grad = torch.autograd.grad(
+                outputs=sdf_val, 
+                inputs=p_current, 
+                grad_outputs=torch.ones_like(sdf_val),
+            )[0]
+            
+            grad_norm = torch.nn.functional.normalize(grad, dim=1)
+            # Project points: x = x - sdf(x) * normal
+            p_current = p_current - sdf_val * grad_norm
+            p_current = p_current.detach().requires_grad_(True)
+
+    # 2. Compute Distance
+    # Direction: Pred -> GT
+    pcd_surf_gt = data["pcd_surf"].to(device)
+    cd_p_gt, _ = chamfer_distance(p_current[None], pcd_surf_gt[None])
     
+    # Direction: GT -> Pred (Requires projecting GT points or sampling SDF)
+    # Usually, for Neural SDFs, we sample the SDF at GT surface points 
+    # and treat that as the distance error.
+    with torch.no_grad():
+        model_preds_abs = model(pcd_surf_gt).abs()
+        dist_gt_p = model_preds_abs.mean() 
+
     model.train()
     
-    return cd, hd
+    # old, not completely correct (was just pcd_surf to mesh)
+    # cd, _ = chamfer_distance(p_current[None], data["pcd_surf"][None])
+    # hd, _ = chamfer_distance(p_current[None], data["pcd_surf"][None], point_reduction="max")
+    
+    cd_2 = (cd_p_gt + dist_gt_p) / 2
+    hd_2 = torch.max(chamfer_distance(p_current[None], pcd_surf_gt[None], point_reduction="max")[0], model_preds_abs.max())
+
+    model.train()
+    
+    return cd_2, hd_2
+
+def compute_trimesh_chamfer(gt_points, gen_mesh, num_mesh_samples=100000):
+    """
+    This function computes a symmetric chamfer distance, i.e. the sum of both chamfers.
+
+    gt_points: trimesh.points.PointCloud of just poins, sampled from the surface (see
+               compute_metrics.ply for more documentation)
+
+    gen_mesh: trimesh.base.Trimesh of output mesh from whichever autoencoding reconstruction
+              method (see compute_metrics.py for more)
+
+    """
+
+    gen_points_sampled = trimesh.sample.sample_surface(gen_mesh, num_mesh_samples)[0]
+
+    # only need numpy array of points
+    # gt_points_np = gt_points.vertices
+    gt_points_np = gt_points.detach().cpu().numpy()
+
+    # one direction
+    gen_points_kd_tree = KDTree(gen_points_sampled)
+    one_distances, one_vertex_ids = gen_points_kd_tree.query(gt_points_np)
+    gt_to_gen_chamfer = np.mean(np.square(one_distances))
+
+    # other direction
+    gt_points_kd_tree = KDTree(gt_points_np)
+    two_distances, two_vertex_ids = gt_points_kd_tree.query(gen_points_sampled)
+    gen_to_gt_chamfer = np.mean(np.square(two_distances))
+
+    return gt_to_gen_chamfer + gen_to_gt_chamfer
+
+def eval_fast(net, data, mesh_path, gt_mesh_path):
+    # step 1: marching cubes
+    print("Step 1: Marching Cubes")
+    mesh_path = Path(mesh_path)
+    assert mesh_path.exists(), f"Mesh path {mesh_path} not found"
+
+    ground_truth_points = data['pcd_surf']
+    reconstruction = trimesh.load(mesh_path)
+
+    print("Step 2: Compute Chamfer Distance")
+    chamfer_dist = compute_trimesh_chamfer(
+                    ground_truth_points,
+                    reconstruction,
+                )
+
+    print("Step 3: Compute IoU")
+    iou = compute_IoU(data, net)
+
+    metrics = compute_meshless_metrics(net, gt_mesh_path)
+    metrics["chamfer_dist"] = chamfer_dist.item()
+    metrics["iou"] = iou.item()
+
+    import json
+    with open(mesh_path.parent / "metrics.json", "w") as f:
+        json.dump(metrics, f, indent=4)
+
 
 def eval(task_name, arch_name, mesh_name, sdf_path=None, save_mesh=True):
     # path is to get rid of the .ply extension
@@ -232,9 +298,6 @@ def eval(task_name, arch_name, mesh_name, sdf_path=None, save_mesh=True):
     import json
     with open(net_dir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=4)
-        
-    # if save_mesh:
-    #     create_mesh(net, net_dir / "mesh.ply", N=512)
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Trains SDF neural networks from point clouds.")

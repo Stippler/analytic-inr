@@ -8,7 +8,7 @@ from neural_spline.geometry import constrained_recursive_pca, flatten_pca_tree
 from .spline import compute_splines
 from .model import ReluMLP
 from .utils import load_mesh_data
-
+from scripts.evaluate import eval_fast
 
 @click.command()
 @click.option('--model', type=str, default='Stanford_armadillo')
@@ -91,6 +91,8 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
         max_candidates_per_segment=max_candidates_per_segment,
         data=data,
     )
+
+    eval_fast(mlp, data, output_path / "mesh_final.ply", Path("data") / "meshes" / f"{model}.ply")
 
 
 if __name__ == "__main__":
