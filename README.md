@@ -32,3 +32,83 @@ which yields the following results:
 }
 ```
 as well as a mesh in `nets/from_sdf/relu_mlp_d4_w128/Stanford_armadillo/mesh.ply`.
+
+<details>
+<summary>Launch Configs</summary>
+```json
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Demo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/demo.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Preprocess: Armadillo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/preprocess.py",
+            "args": [
+                "--mesh", "Stanford_armadillo"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train: Armadillo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/train_sdf.py",
+            "args": [
+                "--task", "from_sdf",
+                "--arch", "relu_mlp_d4_w128",
+                "--mesh", "Stanford_armadillo",
+                "--n_iters", "1000"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Eval: Armadillo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/evaluate.py",
+            "args": [
+                "--task", "from_sdf",
+                "--arch", "relu_mlp_d4_w256",
+                "--mesh", "Stanford_armadillo",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Eval: All",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/evaluate.py",
+            "args": [
+                "--task", "from_sdf",
+                // "--arch", "relu_mlp_d4_w256",
+                // "--mesh", "Stanford_armadillo",
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Metrics: All",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/scripts/accumulate_metrics.py",
+            "args": [
+                "--task", "from_sdf",
+                // "--arch", "relu_mlp_d4_w256",
+                // "--mesh", "Stanford_armadillo",
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+}
+```
+</details>
