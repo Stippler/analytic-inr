@@ -21,9 +21,11 @@ class ReluMLP(nn.Module):
         # First layer
         self.layers.append(nn.Linear(input_dim, hidden_dim))
         
-        # Hidden layers
+        # Hidden layers (with skip connections if enabled)
         for _ in range(num_layers - 1):
-            self.layers.append(nn.Linear(hidden_dim, hidden_dim))
+            # If skip connections, concatenate input to hidden state
+            layer_input_dim = hidden_dim + input_dim if skip_connections else hidden_dim
+            self.layers.append(nn.Linear(layer_input_dim, hidden_dim))
         
         # Output layer
         self.layers.append(nn.Linear(hidden_dim, 1))

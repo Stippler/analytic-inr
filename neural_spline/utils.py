@@ -5,6 +5,7 @@ import trimesh
 from pathlib import Path
 from pytorch3d.structures import Meshes
 from pytorch3d.ops import sample_points_from_meshes
+from skimage import measure
 
 
 def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
@@ -303,4 +304,55 @@ def create_polygons2d(spec, convex=True, star_ratio=0.5, stretch=(1.0, 1.0), rot
         polygons.append(vertices)
     
     return polygons
+
+
+def extract_mesh_marching_cubes(model, save_path: Optional[Path] = None, resolution: int = 128, device=None):
+    """
+    Extract 3D mesh from implicit model using marching cubes.
+    
+    Parameters:
+    -----------
+    model : torch.nn.Module
+        Neural network that outputs SDF values
+    save_path : Path, optional
+        Path to save the extracted mesh (as .ply file)
+    resolution : int
+        Grid resolution for marching cubes (default: 128)
+    device : torch.device, optional
+        Device to run evaluation on
+    
+    Returns:
+    --------
+    tuple
+        (vertices, faces, normals) numpy arrays from marching cubes
+    """
+    if device is None:
+        device = next(model.parameters()).device
+    
+    x = np.linspace(-1, 1, resolution)
+    y = np.linspace(-1, 1, resolution)
+    z = np.linspace(-1, 1, resolution)
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    
+    grid_points = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
+    grid_tensor = torch.from_numpy(grid_points).float().to(device)
+    
+    with torch.no_grad():
+        sdf_values = model(grid_tensor).squeeze().cpu().numpy()
+    
+    sdf_grid = sdf_values.reshape(resolution, resolution, resolution)
+    
+    vertices_mc, faces_mc, normals_mc, _ = measure.marching_cubes(
+        sdf_grid, 
+        level=0.0, 
+        spacing=(2/resolution, 2/resolution, 2/resolution)
+    )
+    
+    vertices_mc -= 1.0
+    
+    if save_path is not None:
+        mesh = trimesh.Trimesh(vertices=vertices_mc, faces=faces_mc, vertex_normals=normals_mc)
+        mesh.export(save_path)
+    
+    return vertices_mc, faces_mc, normals_mc
 

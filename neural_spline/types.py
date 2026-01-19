@@ -36,22 +36,24 @@ class ConvexPolytope:
         assert self.normals.shape[1] == self.dimension, \
             f"Normal dimension {self.normals.shape[1]} must match polytope dimension {self.dimension}"
     
-    def add_constraint(self, normal: torch.Tensor, offset: float) -> 'ConvexPolytope':
+    def add_constraint(self, normal: torch.Tensor, offset: torch.Tensor) -> 'ConvexPolytope':
         """
         Add a new half-space constraint to the polytope.
         
         Args:
             normal: (D,) normal vector for the new half-space
-            offset: Scalar offset value
+            offset: Scalar offset tensor
             
         Returns:
             New ConvexPolytope with added constraint
         """
         new_normals = torch.cat([self.normals, normal.unsqueeze(0)], dim=0)
-        new_offsets = torch.cat([self.offsets, torch.tensor([offset], device=self.offsets.device)])
+        if offset.dim() == 0:
+            offset = offset.unsqueeze(0)
+        new_offsets = torch.cat([self.offsets, offset])
         return ConvexPolytope(new_normals, new_offsets, self.dimension)
     
-    def clip_ray(self, origin: torch.Tensor, direction: torch.Tensor) -> tuple[Optional[float], Optional[float]]:
+    def clip_ray(self, origin: torch.Tensor, direction: torch.Tensor) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Clip a ray against the polytope to find entry/exit points.
         
@@ -65,44 +67,33 @@ class ConvexPolytope:
             (t_min, t_max): Parameter values where ray enters/exits polytope
                            Returns (None, None) if no intersection
         """
-        # Normalize direction
         dir_norm = torch.norm(direction)
         if dir_norm < 1e-12:
             return None, None
         direction = direction / dir_norm
         
-        t_min = float('-inf')
-        t_max = float('inf')
+        device = origin.device
+        t_min = torch.tensor(float('-inf'), device=device)
+        t_max = torch.tensor(float('inf'), device=device)
         
-        # For each half-space: normal · x <= offset
         for i in range(len(self.normals)):
             n = self.normals[i]
             d = self.offsets[i]
             
-            # Compute: normal · direction
-            denom = torch.dot(n, direction).item()
+            denom = torch.dot(n, direction)
+            numer = d - torch.dot(n, origin)
             
-            # Compute: offset - normal · origin
-            numer = d - torch.dot(n, origin).item()
-            
-            if abs(denom) < 1e-12:
-                # Ray is parallel to plane
+            if torch.abs(denom) < 1e-12:
                 if numer < 0:
-                    # Ray origin is outside this half-space
                     return None, None
-                # Otherwise, continue (ray is inside or on boundary)
             else:
-                # Ray intersects plane at t = numer / denom
                 t = numer / denom
                 
                 if denom < 0:
-                    # Ray is entering this half-space
-                    t_min = max(t_min, t)
+                    t_min = torch.maximum(t_min, t)
                 else:
-                    # Ray is exiting this half-space
-                    t_max = min(t_max, t)
+                    t_max = torch.minimum(t_max, t)
         
-        # Check if interval is valid
         if t_min > t_max or t_max < 0:
             return None, None
         
@@ -142,9 +133,9 @@ class PCAComponent:
         return d / (torch.norm(d) + 1e-12)
     
     @property
-    def length(self) -> float:
+    def length(self) -> torch.Tensor:
         """Get length of segment."""
-        return torch.norm(self.end - self.start).item()
+        return torch.norm(self.end - self.start)
     
     @property
     def midpoint(self) -> torch.Tensor:
@@ -191,9 +182,9 @@ class Spline:
         return d / (torch.norm(d) + 1e-12)
     
     @property
-    def length(self) -> float:
+    def length(self) -> torch.Tensor:
         """Get length of segment."""
-        return torch.norm(self.end_point - self.start_point).item()
+        return torch.norm(self.end_point - self.start_point)
     
     def has_predictions(self) -> bool:
         """Check if predictions have been computed."""
@@ -269,3 +260,7 @@ class Splines:
     values: torch.Tensor
 
     normals: torch.Tensor
+    
+    nconf: torch.Tensor = None
+    sconf: torch.Tensor = None
+    sign_uncertain: torch.Tensor = None

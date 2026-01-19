@@ -255,60 +255,23 @@ def subdivide_segments(
 
     return new_start_points, new_end_points, t_start, t_end, mapping_idx
 
-
-def compute_splines(data: dict, components: List[PCAComponent], num_samples: int = 50_000) -> List[torch.Tensor]:
-    # Get all samples
-    sample_points, sample_normals = sample_surface_pointcloud(
-        data['vertices'],
-        data['faces'],
-        num_samples,
-    )
-    
-    # Get all rays
-    start_points = torch.stack([c.start for c in components], dim=0)
-    end_points = torch.stack([c.end for c in components], dim=0)
-    print(f"Scale Segments")
-    tik = time.time()
-    start_points, end_points, L = scale_segments(start_points, end_points)
-    tok = time.time()
-    print(f"Scale Segments took {tok - tik} seconds")
-    print(f"Compute Ray Geometry")
-    tik = time.time()
-    t_hit, hit_count, hit_points, hit_normals, surface_points, surface_normals = compute_ray_geometry(start_points, end_points, data['mesh'])
-    tok = time.time()
-    print(f"Compute Ray Geometry took {tok - tik} seconds")
-    print(f"Subdivide Segments")
-    tik = time.time()
-    new_start_points, new_end_points, t_start, t_end, mapping_idx = subdivide_segments(start_points, end_points, L)
-    tok = time.time()
-    print(f"Subdivide Segments took {tok - tik} seconds")
-    print(f"Sample Surface Pointcloud")
-    tik = time.time()
-    sample_points, sample_normals = sample_surface_pointcloud(data['vertices'], data['faces'], num_samples)
-    sample_points = torch.cat([sample_points, surface_points], dim=0)
-    sample_normals = torch.cat([sample_normals, surface_normals], dim=0)
-    tok = time.time()
-    print(f"Sample Surface Pointcloud took {tok - tik} seconds")
-    print(f"Concatenate Points and Normals")
-    tik = time.time()
-
-    # For 2d remove points that look to the top or bottom
-    if data['type'] == '2d':
-        eps = 1e-4
-        mask = sample_normals[:, 2].abs() < eps
-        sample_points = sample_points[mask][:, :2]
-        sample_normals = sample_normals[mask][:, :2]
-    
-    # Calculate SDF for each segment
-    print(f"Computing SDF for segments")
-    tik = time.time()
-    batch_size = 1024
-
-    n_samples_per_segment = 32
-    n_selected_samples = 16
-    
-
-
+def get_knots_and_sdf(
+    start_points: torch.Tensor,
+    new_start_points: torch.Tensor,
+    new_end_points: torch.Tensor,
+    t_start: torch.Tensor,
+    t_end: torch.Tensor,
+    mapping_idx: torch.Tensor,
+    t_hit: torch.Tensor,
+    hit_count: torch.Tensor,
+    hit_points: torch.Tensor,
+    hit_normals: torch.Tensor,
+    sample_points: torch.Tensor,
+    sample_normals: torch.Tensor,
+    batch_size: int,
+    n_samples_per_segment: int,
+    n_selected_samples: int,
+):
     device = start_points.device
     u_local = torch.linspace(0.0, 1.0, n_samples_per_segment, device=device)
     all_sdf = []
@@ -376,18 +339,269 @@ def compute_splines(data: dict, components: List[PCAComponent], num_samples: int
         all_sdf.append(sdf)
         all_normals.append(normals)
         all_knots.append(knots)
-        
-        
-    tok = time.time()
-    print(f"Computing SDF for segments took {tok - tik} seconds")
+    return all_sdf, all_normals, all_knots
 
-    splines = Splines(
-        start_points=new_start_points,
-        end_points=new_end_points,
-        knots=torch.cat(all_knots, dim=0),
-        values=torch.cat(all_sdf, dim=0),
-        normals=torch.cat(all_normals, dim=0),
+def get_knots_and_sdf2(
+    start_points: torch.Tensor,
+    end_points: torch.Tensor,
+    sample_points: torch.Tensor,
+    sample_normals: torch.Tensor,
+    batch_size: int,
+    n_samples_per_segment: int,
+    n_selected_samples: int,
+    knn_k: int=64,
+    eps: float=1e-12,
+    conf_threshold: float = 0.35,
+    min_anchors: int = 2,
+    fallback_sign: float = 1.0,
+):
+    device = start_points.device
+    D = start_points.shape[1]
+
+    assert sample_points.device == device and sample_normals.device == device
+
+    norms = sample_normals.norm(dim=1)
+    assert torch.allclose(norms, torch.ones_like(norms), rtol=1e-3, atol=1e-3), \
+        f"sample_normals not unit: mean={norms.mean().item():.4f}, max_err={(norms-1).abs().max().item():.4f}"
+
+    all_sdf = []
+    all_normals = []
+    all_knots = []
+    all_nconf = []
+    all_sconf = []
+    all_sign_uncertain = []
+    u_local = torch.linspace(0.0, 1.0, n_samples_per_segment, device=device)
+    
+
+    for i in tqdm(range(0, len(start_points), batch_size), desc="Computing SDF"):
+        p0 = start_points[i:i+batch_size]
+        p1 = end_points[i:i+batch_size]
+        dirs = p1 - p0
+        query = p0[:, None, :] + u_local[None, :, None] * dirs[:, None, :]
+
+        B, T, _ = query.shape
+        Q = B*T
+        query_flat = query.reshape(Q, D)
+
+        # --- KNN(K) ---
+        knn = knn_points(query_flat[None], sample_points[None], K=knn_k)
+        idx = knn.idx[0]      # (Q,K)
+        d2  = knn.dists[0]    # (Q,K)
+
+        nbr_p = sample_points[idx]    # (Q,K,D)
+        nbr_n = sample_normals[idx]   # (Q,K,D)
+
+        x = query_flat[:, None, :]    # (Q,1,D)
+        v = x - nbr_p                 # (Q,K,D)
+        
+        # --- distance weights (local bandwidth from median neighbor distance) ---
+        sigma2 = d2[:, knn_k//2:knn_k//2+1].clamp_min(eps)     # (Q,1)
+        w = torch.exp(-d2 / sigma2)                             # (Q,K)
+        w = w / (w.sum(dim=1, keepdim=True) + eps)              # (Q,K)
+        
+        # --- unsigned magnitude: stable min-distance ---
+        d_min = torch.sqrt(d2.min(dim=1).values.clamp_min(eps)) # (Q,)
+        
+        # --- normal estimate + normal agreement confidence ---
+        # Normal agreement: || sum w_i n_i || in [0,1]
+        n_sum = (w[..., None] * nbr_n).sum(dim=1)               # (Q,D)
+        n_conf = n_sum.norm(dim=1).clamp(0.0, 1.0)              # (Q,)
+        n_hat = n_sum / (n_conf[:, None] + eps)                 # (Q,D)
+        
+        # --- sign vote from weighted point-to-plane distances ---
+        s_i = (v * nbr_n).sum(dim=2)                            # (Q,K)
+        s_hat = (w * s_i).sum(dim=1)                            # (Q,)
+        sign_raw = torch.where(s_hat >= 0.0, 1.0, -1.0)          # (Q,)
+        
+        # --- sign agreement confidence ---
+        # c_s ~ 1 means neighbors agree on sign(s_i); ~0 means mixed
+        s_conf = (w * torch.sign(s_i)).sum(dim=1).abs().clamp(0.0, 1.0)  # (Q,)
+        
+        # combine into a single sign confidence (anchors should be both coherent + consistent)
+        sign_conf = (n_conf * s_conf).clamp(0.0, 1.0)           # (Q,)
+        
+        # reshape to (B,T,...)
+        d_min = d_min.view(B, T)
+        sign_raw = sign_raw.view(B, T)
+        n_hat = n_hat.view(B, T, D)
+        n_conf = n_conf.view(B, T)
+        sign_conf = sign_conf.view(B, T)
+        
+        # --- sign propagation ---
+        anchor = (sign_conf >= conf_threshold)
+        anchor_count = anchor.sum(dim=1)
+        ok = anchor_count >= min_anchors
+
+        t = torch.arange(T, device=device)
+        dist = (t[None, :, None] - t[None, None, :]).abs()
+        dist = dist.expand(B, -1, -1).clone()                  # (B,T,T)
+        dist = dist.masked_fill_(~anchor[:, None, :], torch.iinfo(dist.dtype).max)
+
+        nearest=dist.argmin(dim=2)
+        sign_prop= sign_raw.gather(1, nearest)
+        prop_conf = sign_conf.gather(1, nearest)
+        prop_conf = torch.where(ok[:, None], prop_conf, torch.zeros_like(prop_conf))
+
+        sign_uncertain_dense = (~ok[:, None]) | (prop_conf < conf_threshold)
+        fallback = torch.full((B, T), float(fallback_sign), device=device, dtype=sign_raw.dtype)
+        sign_prop = torch.where(ok[:, None], sign_prop, fallback)
+
+        # signed sdf + sign-aligned normals
+        sdf_dense = sign_prop * d_min                 # (B,T)
+        normals_dense = n_hat * sign_prop[..., None]  # (B,T,D)
+
+        # --- subsample dense line samples into knots ---
+        # curvature importance on signed sdf
+        importance = ((sdf_dense[:, :-2] + sdf_dense[:, 2:]) * 0.5 - sdf_dense[:, 1:-1]).abs()  # (B,T-2)
+
+        first = torch.zeros((B, 1), device=device, dtype=torch.long)
+        last = torch.full((B, 1), T - 1, device=device, dtype=torch.long)
+        interior = torch.argsort(importance, dim=1, descending=True)[:, :max(n_selected_samples - 2, 0)] + 1
+
+        indices = torch.cat([first, interior, last], dim=1)
+        indices, _ = torch.sort(indices, dim=1)  # keep knot order
+
+        knots = u_local[None, :].expand(B, -1).gather(1, indices)
+        sdf = sdf_dense.gather(1, indices)
+        normals = normals_dense.gather(1, indices.unsqueeze(2).expand(-1, -1, D))
+
+        # confidences at knots (for later losses)
+        nconf_k = n_conf.gather(1, indices)
+        sconf_k = prop_conf.gather(1, indices)
+        sign_uncertain_k = sign_uncertain_dense.gather(1, indices)  # (B, n_selected_samples)
+        
+        all_sign_uncertain.append(sign_uncertain_k)
+        all_knots.append(knots)
+        all_sdf.append(sdf)
+        all_normals.append(normals)
+        all_nconf.append(nconf_k)
+        all_sconf.append(sconf_k)
+
+    return (
+        torch.cat(all_sdf, dim=0),
+        torch.cat(all_normals, dim=0),
+        torch.cat(all_knots, dim=0),
+        torch.cat(all_nconf, dim=0),
+        torch.cat(all_sconf, dim=0),
+        torch.cat(all_sign_uncertain, dim=0),
     )
+
+def compute_splines(data: dict, components: List[PCAComponent], num_samples: int = 50_000, use_knn_method: bool = True) -> List[torch.Tensor]:
+    # Get all rays
+    start_points = torch.stack([c.start for c in components], dim=0)
+    end_points = torch.stack([c.end for c in components], dim=0)
+    print(f"Scale Segments")
+    tik = time.time()
+    start_points, end_points, L = scale_segments(start_points, end_points)
+    tok = time.time()
+    print(f"Scale Segments took {tok - tik} seconds")
+    
+    batch_size = 1024
+    n_samples_per_segment = 32
+    n_selected_samples = 16
+    
+    if use_knn_method:
+        # KNN-based method (get_knots_and_sdf2)
+        print(f"Subdivide Segments")
+        tik = time.time()
+        new_start_points, new_end_points, t_start, t_end, mapping_idx = subdivide_segments(start_points, end_points, L)
+        tok = time.time()
+        print(f"Subdivide Segments took {tok - tik} seconds")
+        print(f"Sample Surface Pointcloud")
+        tik = time.time()
+        sample_points, sample_normals = sample_surface_pointcloud(data['vertices'], data['faces'], num_samples)
+        tok = time.time()
+        print(f"Sample Surface Pointcloud took {tok - tik} seconds")
+        
+        # For 2d remove points that look to the top or bottom
+        if data['type'] == '2d':
+            eps = 1e-4
+            mask = sample_normals[:, 2].abs() < eps
+            sample_points = sample_points[mask][:, :2]
+            sample_normals = sample_normals[mask][:, :2]
+        
+        # Calculate SDF for each segment
+        print(f"Computing SDF for segments (KNN method)")
+        tik = time.time()
+        all_sdf, all_normals, all_knots, all_nconf, all_sconf, all_sign_uncertain = get_knots_and_sdf2(
+            start_points=new_start_points,
+            end_points=new_end_points,
+            sample_points=sample_points,
+            sample_normals=sample_normals,
+            batch_size=batch_size,
+            n_samples_per_segment=n_samples_per_segment,
+            n_selected_samples=n_selected_samples,
+        )
+        tok = time.time()
+        print(f"Computing SDF for segments took {tok - tik} seconds")
+
+        splines = Splines(
+            start_points=new_start_points,
+            end_points=new_end_points,
+            knots=all_knots,
+            values=all_sdf,
+            normals=all_normals,
+            nconf=all_nconf,
+            sconf=all_sconf,
+            sign_uncertain=all_sign_uncertain,
+        )
+    else:
+        # Ray tracing method (get_knots_and_sdf)
+        print(f"Compute Ray Geometry")
+        tik = time.time()
+        t_hit, hit_count, hit_points, hit_normals, surface_points, surface_normals = compute_ray_geometry(start_points, end_points, data['mesh'])
+        tok = time.time()
+        print(f"Compute Ray Geometry took {tok - tik} seconds")
+        print(f"Subdivide Segments")
+        tik = time.time()
+        new_start_points, new_end_points, t_start, t_end, mapping_idx = subdivide_segments(start_points, end_points, L)
+        tok = time.time()
+        print(f"Subdivide Segments took {tok - tik} seconds")
+        print(f"Sample Surface Pointcloud")
+        tik = time.time()
+        sample_points, sample_normals = sample_surface_pointcloud(data['vertices'], data['faces'], num_samples)
+        sample_points = torch.cat([sample_points, surface_points], dim=0)
+        sample_normals = torch.cat([sample_normals, surface_normals], dim=0)
+        tok = time.time()
+        print(f"Sample Surface Pointcloud took {tok - tik} seconds")
+        
+        # For 2d remove points that look to the top or bottom
+        if data['type'] == '2d':
+            eps = 1e-4
+            mask = sample_normals[:, 2].abs() < eps
+            sample_points = sample_points[mask][:, :2]
+            sample_normals = sample_normals[mask][:, :2]
+        
+        # Calculate SDF for each segment
+        print(f"Computing SDF for segments (ray tracing method)")
+        tik = time.time()
+        all_sdf, all_normals, all_knots = get_knots_and_sdf(
+            start_points=start_points,
+            new_start_points=new_start_points,
+            new_end_points=new_end_points,
+            t_start=t_start,
+            t_end=t_end,
+            mapping_idx=mapping_idx,
+            t_hit=t_hit,
+            hit_count=hit_count,
+            hit_points=hit_points,
+            hit_normals=hit_normals,
+            sample_points=sample_points,
+            sample_normals=sample_normals,
+            batch_size=batch_size,
+            n_samples_per_segment=n_samples_per_segment,
+            n_selected_samples=n_selected_samples,
+        )
+        tok = time.time()
+        print(f"Computing SDF for segments took {tok - tik} seconds")
+
+        splines = Splines(
+            start_points=new_start_points,
+            end_points=new_end_points,
+            knots=torch.cat(all_knots, dim=0),
+            values=torch.cat(all_sdf, dim=0),
+            normals=torch.cat(all_normals, dim=0),
+        )
 
     return splines
 
