@@ -221,3 +221,4 @@ profiler_logs/*
 outputs/*
 # point clouds (for sdf learning)
 nets/
+pytorch3d/

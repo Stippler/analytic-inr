@@ -196,7 +196,9 @@ def train_model_fast(mlp: ReluMLP,
                      save_path=None,
                      extract_mesh: bool = False,
                      mesh_resolution: int = 128,
-                     mesh_save_interval: int = 50):
+                     mesh_save_interval: int = 50,
+                     store_sdf: bool = True,
+                     sdf_save_interval: int = 50):
     device = splines.start_points.device
     mlp = mlp.to(device)
 
@@ -258,6 +260,7 @@ def train_model_fast(mlp: ReluMLP,
             if save_path:
                 torch.save({
                     'epoch': epoch,
+                    'config': mlp.config(),
                     'model_state_dict': mlp.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'loss': best_loss,
@@ -269,6 +272,16 @@ def train_model_fast(mlp: ReluMLP,
                 extract_mesh_marching_cubes(mlp, save_path=mesh_path, resolution=mesh_resolution, device=device)
             except Exception as e:
                 print(f"Error extracting mesh: {e}")
+                
+        if store_sdf and save_path and epoch % sdf_save_interval == 0:
+            checkpoint = {
+                "epoch": epoch,
+                "config": mlp.config(),
+                "model_state_dict": mlp.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "loss": best_loss,
+            }
+            torch.save(checkpoint, save_path / f"sdf_epoch_{epoch:04d}.pt")
 
         pbar.set_postfix({'loss': f"{avg_loss:.6f}", 'best': f"{best_loss:.6f}"})
 

@@ -62,6 +62,7 @@ as well as a mesh in `nets/from_sdf/relu_mlp_d4_w128/Stanford_armadillo/mesh.ply
 
 <details>
 <summary>Launch Configs</summary>
+
 ```json
 {
     // Use IntelliSense to learn about possible attributes.

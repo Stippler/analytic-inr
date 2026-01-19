@@ -1,5 +1,6 @@
 import click
 import torch
+torch._dynamo.reset()
 from pathlib import Path
 from datetime import datetime
 from neural_spline.train_fast import train_model_fast
@@ -10,11 +11,11 @@ from .utils import load_mesh_data
 
 
 @click.command()
-@click.option('--model', type=str, default='Armadillo')
+@click.option('--model', type=str, default='Stanford_armadillo')
 @click.option('--epochs', type=int, default=1000)
 @click.option('--hidden-dim', type=int, default=64)
 @click.option('--num-layers', type=int, default=4)
-@click.option('--batch-size', type=int, default=8192)
+@click.option('--batch-size', type=int, default=4096)
 @click.option('--lr', type=float, default=0.01)
 @click.option('--max-depth', type=int, default=6)
 @click.option('--use-knn/--no-use-knn', default=True)
@@ -46,6 +47,9 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
 
     splines = compute_splines(data, components, 500_000, use_knn_method=use_knn)
     print(f"Computed {len(splines.start_points)} splines")
+
+    del data
+    torch.cuda.empty_cache()
 
     mlp = ReluMLP(
         input_dim=input_dim,

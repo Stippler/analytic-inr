@@ -13,6 +13,7 @@ import open3d as o3d
 import torch
 import torch.nn.functional as F
 from scipy.spatial import KDTree, cKDTree
+from neural_spline.model import ReluMLP
 from geomloss import SamplesLoss
 from tqdm import tqdm
 
@@ -129,18 +130,30 @@ def compute_meshless_metrics(model, gt_mesh_path, num_samples=30000):
         "emd_loss": emd_loss_tensor.item()
     }
 
-def eval(task_name, arch_name, mesh_name, save_mesh=True):
+def eval(task_name, arch_name, mesh_name, sdf_path=None, save_mesh=True):
     # path is to get rid of the .ply extension
-    net_dir = root_dir / "nets" / task_name / arch_name / Path(mesh_name).stem
-    
-    if not net_dir.exists():
-        return
-        raise FileNotFoundError(f"Net directory {net_dir} not found")
-    
-    net = architectures.by_name(arch_name).cuda()
-    net.load_state_dict(torch.load(net_dir / "net.pt", weights_only=True))
-    net.cuda()
+    try:
+        net_dir = root_dir / "nets" / task_name / arch_name / Path(mesh_name).stem
+        
+        if not net_dir.exists():
+            return
+            raise FileNotFoundError(f"Net directory {net_dir} not found")
+        
+        net = architectures.by_name(arch_name).cuda()
+        net.load_state_dict(torch.load(net_dir / "net.pt", weights_only=True))
+    except Exception as e:
+        # here, try the sdf_path
+        if sdf_path is None:
+            raise e
+        config = torch.load(sdf_path, weights_only=True)
+        net = ReluMLP.restore_from_config(config["config"])
+        net.load_state_dict(config["model_state_dict"])
+        
+        # net_dir is where the outputs flow to
+        net_dir = sdf_path.parent
+        
 
+    net.cuda()
     net.eval()
 
     gt_mesh_path = root_dir / "data" / "meshes" / f"{Path(mesh_name).stem}.ply"
@@ -162,19 +175,27 @@ def eval(task_name, arch_name, mesh_name, save_mesh=True):
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Trains SDF neural networks from point clouds.")
-    parser.add_argument("--task", required=True)
+    parser.add_argument("--task", required=False)
     # if the following arguments are not provided, all nets and meshes will be evaluated
     parser.add_argument("--arch", action="extend", nargs="+", required=False)
     parser.add_argument("--mesh", action="extend", nargs="+", required=False)
     parser.add_argument("--save_mesh", action="store_true", required=False)
+    parser.add_argument("--sdf_path", type=str, required=False)
     args = parser.parse_args()
     
-    calls = []
-    task_dir = root_dir / "nets" / args.task
-    mesh_dir = root_dir / "data" / "meshes"
-    
-    arch = args.arch or (p.name for p in task_dir.iterdir())
-    mesh = args.mesh or (p.name for p in mesh_dir.iterdir())
-    
-    for call in tqdm(list(product(arch, mesh)), desc="nets"):
-        eval(args.task, *call, args.save_mesh)
+    # for the new script (more versatile)
+    if args.sdf_path:
+        assert args.mesh is not None, "Mesh is required when sdf_path is provided"
+        sdf_path = Path(args.sdf_path)
+        assert sdf_path.exists(), f"SDF path {sdf_path} not found"
+        eval(args.task, args.arch, args.mesh[0], sdf_path, args.save_mesh)
+    else:
+        calls = []
+        task_dir = root_dir / "nets" / args.task
+        mesh_dir = root_dir / "data" / "meshes"
+        
+        arch = args.arch or (p.name for p in task_dir.iterdir())
+        mesh = args.mesh or (p.name for p in mesh_dir.iterdir())
+        
+        for call in tqdm(list(product(arch, mesh)), desc="nets"):
+            eval(args.task, *call, args.save_mesh)
