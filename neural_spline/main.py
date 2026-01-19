@@ -14,7 +14,7 @@ from .utils import load_mesh_data
 @click.option('--epochs', type=int, default=1000)
 @click.option('--hidden-dim', type=int, default=64)
 @click.option('--num-layers', type=int, default=4)
-@click.option('--batch-size', type=int, default=2048)
+@click.option('--batch-size', type=int, default=4096)
 @click.option('--lr', type=float, default=0.01)
 @click.option('--max-depth', type=int, default=5)
 @click.option('--use-knn/--no-use-knn', default=True)
@@ -23,7 +23,10 @@ from .utils import load_mesh_data
 @click.option('--save-dir', type=str, default=None)
 @click.option('--mesh-save-interval', type=int, default=50)
 @click.option('--skip-connections/--no-skip-connections', default=False)
-def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_knn, extract_mesh, mesh_resolution, save_dir, mesh_save_interval, skip_connections):
+@click.option('--detailed-stats/--no-detailed-stats', default=False, help='Collect detailed per-layer and spatial statistics')
+@click.option('--max-knots', type=int, default=32, help='Maximum number of knots per spline')
+@click.option('--max-candidates-per-segment', type=int, default=None, help='Maximum candidates per segment (None = no limit, e.g., 4 or 8 for speedup)')
+def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_knn, extract_mesh, mesh_resolution, save_dir, mesh_save_interval, skip_connections, detailed_stats, max_knots, max_candidates_per_segment):
     if model.lower() in ['simple', 'hard']:
         dim = '2d'
         input_dim = 2
@@ -82,6 +85,9 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
         extract_mesh=extract_mesh and dim == '3d',
         mesh_resolution=mesh_resolution,
         mesh_save_interval=mesh_save_interval,
+        collect_detailed_stats=detailed_stats,
+        max_knots=max_knots,
+        max_candidates_per_segment=max_candidates_per_segment,
     )
 
 
