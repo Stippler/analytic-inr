@@ -32,7 +32,18 @@ from .utils import load_mesh_data
               help='Disable torch.compile (enabled by default)')
 @click.option('--precision', type=click.Choice(['fp32', 'bfloat16', 'fp16']), default='fp32',
               help='Training precision (fp32, bfloat16, fp16)')
-def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact, no_compile, precision):
+@click.option('--profile/--no-profile', default=True,
+              help='Enable PyTorch profiler for performance analysis')
+@click.option('--profile-wait', type=int, default=1,
+              help='Profiler: number of batches to skip before profiling')
+@click.option('--profile-warmup', type=int, default=1,
+              help='Profiler: number of warmup batches')
+@click.option('--profile-active', type=int, default=3,
+              help='Profiler: number of batches to actively profile')
+@click.option('--profile-repeat', type=int, default=1,
+              help='Profiler: number of times to repeat profiling cycle')
+def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact, no_compile, precision,
+         profile, profile_wait, profile_warmup, profile_active, profile_repeat):
     """Unified training command for 2D and 3D."""
     
     # ========================================
@@ -50,6 +61,9 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
     click.echo(f"Model: {model}")
     click.echo(f"Precision: {precision}")
     click.echo(f"torch.compile: {'Disabled' if no_compile else 'Enabled'}")
+    click.echo(f"Profiler: {'Enabled' if profile else 'Disabled'}")
+    if profile:
+        click.echo(f"  - Wait: {profile_wait}, Warmup: {profile_warmup}, Active: {profile_active}, Repeat: {profile_repeat}")
     click.echo(f"{'='*60}\n")
     
     # ========================================
@@ -106,6 +120,13 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
     # 5. Create Splines
     # ========================================
     splines = compute_splines(data, components, 50_000)
+    
+    # Calculate statistics for summary
+    total_knots = splines.knots.shape[0]*splines.knots.shape[1]
+    total_samples = len(components) * 50_000  # samples per component
+    
+    click.echo(f"  Total knots: {total_knots:,}")
+    click.echo(f"  Compression: {total_samples / total_knots:.1f}x")
 
     
     # ========================================
@@ -129,6 +150,13 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
         'training_config': {
             'precision': precision,
             'use_compile': not no_compile
+        },
+        'profiler_config': {
+            'enabled': profile,
+            'wait': profile_wait,
+            'warmup': profile_warmup,
+            'active': profile_active,
+            'repeat': profile_repeat
         },
         'timestamp': timestamp
     }
@@ -165,6 +193,11 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
         lr=lr,
         clip_grad_norm=1.0,
         save_path=exp_dir,
+        profile_enabled=profile,
+        profile_wait=profile_wait,
+        profile_warmup=profile_warmup,
+        profile_active=profile_active,
+        profile_repeat=profile_repeat,
     )
     
     # Save loss history
@@ -172,7 +205,8 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, exact
     
     # Update predictions
     click.echo(f"\nUpdating spline predictions...")
-    update_spline_predictions(mlp, splines, use_compile=use_compile)
+    use_compile = not no_compile
+    # update_spline_predictions(mlp, splines, use_compile=use_compile)
     
     # ========================================
     # 10. Summary

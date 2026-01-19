@@ -60,7 +60,7 @@ def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
             poly = np.asarray(poly, dtype=np.float64)
 
             prism = trimesh.creation.extrude_polygon(
-                polygon=trimesh.path.polygons.polygon.Polygon(poly),
+                polygon=trimesh.path.polygons.Polygon(poly),
                 height=thickness,
             )
 
@@ -72,9 +72,9 @@ def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
         mesh = trimesh.util.concatenate(meshes)
 
         # Optional cleanup (safe)
-        mesh.remove_duplicate_faces()
-        mesh.remove_unreferenced_vertices()
-        mesh.process(validate=True)
+        # mesh.remove_duplicate_faces()
+        # mesh.remove_unreferenced_vertices()
+        # mesh.process(validate=True)
 
         print(f"  Mesh vertices: {len(mesh.vertices)}, faces: {len(mesh.faces)}")
 

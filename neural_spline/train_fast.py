@@ -65,40 +65,28 @@ def sort_and_drop_duplicates(t_vals, batch_ids, values=None, eps=1e-6):
     return t_vals[final_perm], batch_ids[final_perm], None
 
 
-def reset_predictions_tensor_mode(mlp: nn.Module, p0: torch.Tensor, p1: torch.Tensor):
-    """
-    Computes analytical knots for a batch of segments simultaneously.
-    
-    This uses a sweep-line algorithm to track knot positions across a batch
-    of line segments, processing zero-crossings in the ReLU activations.
-    
-    Args:
-        mlp: The neural network (ReluMLP)
-        p0: (B, D) Start points
-        p1: (B, D) End points
-        
-    Returns:
-        pred_t_pad: (B, Max_Knots) Padded tensor of knot locations
-        pred_v_pad: (B, Max_Knots) Padded tensor of values at knots
-    """
+def forward(mlp: nn.Module, p0: torch.Tensor, p1: torch.Tensor, max_knots=128):
     device = p0.device
     B = p0.shape[0]
     
     # Get linear layers from the MLP
-    layers = list(mlp.layers)
-    
-    # --- Initialize: t=0 and t=1 for all batches ---
-    t_start = torch.zeros(B, device=device, dtype=p0.dtype)
-    t_end = torch.ones(B, device=device, dtype=p0.dtype)
-    
-    t_flat = torch.stack([t_start, t_end], dim=1).reshape(-1)  # (2B,)
-    batch_ids = torch.arange(B, device=device).repeat_interleave(2)  # (2B,)
-    
-    # Compute Initial Input H0 = p0 + t * (p1 - p0)
+    layers = mlp.layers
+
+    mask = torch.tensor((B, 128), device = device, dtype = torch.bool)
+    # TODO: first two are true
+    knots = torch.tensor((B, 128), device = device, dtype = p0.dtype)
+    # First two are 0 and 1, after that repeat 1
+    # Calculate first layer weights and bias togheter with direction and offset so that multiplications/addition are then 1 input, n outputs
+    # Then multiply this with knots to get the values
+    normals = torch.tensor((B, 127, layers[0].weight.shape), device = device, dtype = p0.dtype)
+    offsets = torch.tensor((B, 127, layers[0].bias.shape), device = device, dtype = p0.dtype)
+    mask = torch.zeros((B, 128), device = device, dtype = torch.float32)
+    mask[:, 0:1] = 1.0
+
     d = p1 - p0  # (B, D)
-    # Gather: p0[batch_ids] expands p0 to match the flat structure
-    h_flat = p0[batch_ids] + t_flat.unsqueeze(1) * d[batch_ids]  # (2B, D_in)
-    
+    W = layers[0].weight
+    b = layers[0].bias
+
     eps = 1e-8
     
     for i, layer in enumerate(layers):
@@ -193,7 +181,7 @@ def reset_predictions_tensor_mode(mlp: nn.Module, p0: torch.Tensor, p1: torch.Te
 # 2. Vectorized Loss Function
 # ==========================================
 
-def batch_exact_integral_loss(pred_t, pred_v, gt_t, gt_v):
+def integral_loss(pred_t, pred_v, gt_t, gt_v):
     """
     Computes exact integral of (Pred - GT)^2 for a batch using Simpson's rule.
     
@@ -281,76 +269,23 @@ def train_model_fast(mlp: ReluMLP,
                      profile_enabled: bool = False,
                      profile_wait: int = 1,
                      profile_warmup: int = 1,
-                     profile_active: int = 3,
+                     profile_active: int = 1,
                      profile_repeat: int = 1):
-    """
-    Fast, batched training loop for neural spline learning.
-    
-    This is a vectorized version of train_model that processes multiple
-    splines simultaneously, significantly improving training speed.
-    
-    Args:
-        mlp: The neural network to train
-        splines: Splines with ground truth data
-        epochs: Number of training epochs
-        batch_size: Batch size for training
-        lr: Learning rate
-        clip_grad_norm: Maximum gradient norm for clipping
-        save_path: Optional path to save best model checkpoint
-        profile_enabled: Enable PyTorch profiler
-        profile_wait: Number of steps to wait before profiling
-        profile_warmup: Number of warmup steps
-        profile_active: Number of steps to profile
-        profile_repeat: Number of times to repeat the profiling cycle
-    
-    Returns:
-        loss_history: List of average loss per epoch
-    """
-    # Determine device from first spline
     device = splines.start_points.device
     mlp = mlp.to(device)
-    
-    # GPU Diagnostic
-    print("\n" + "="*60)
-    print("GPU DIAGNOSTIC - Fast Training")
-    print("="*60)
-    print(f"Device: {device}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
-        print(f"CUDA memory cached: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
-    print(f"Model device: {next(mlp.parameters()).device}")
-    print(f"Spline data device: {splines.start_points.device}")
-    print("="*60 + "\n")
     
     optimizer = optim.Adam(mlp.parameters(), lr=lr)
     
     N = splines.start_points.shape[0]
-    print(f"Training on {N} splines with batch size {batch_size}")
     
     loss_history = []
     best_loss = float('inf')
-    best_epoch = 0
     
     # Setup profiler if enabled
     prof_context = None
     if profile_enabled:
-        print("\n" + "="*60)
-        print("PROFILER ENABLED")
-        print("="*60)
-        print(f"Wait steps: {profile_wait}")
-        print(f"Warmup steps: {profile_warmup}")
-        print(f"Active steps: {profile_active}")
-        print(f"Repeat: {profile_repeat}")
-        
         activities = [ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(ProfilerActivity.CUDA)
-            print("Profiling both CPU and CUDA")
-        else:
-            print("Profiling CPU only")
-        print("="*60 + "\n")
+        activities.append(ProfilerActivity.CUDA)
         
         prof_context = profile(
             activities=activities,
@@ -372,91 +307,70 @@ def train_model_fast(mlp: ReluMLP,
     if prof_context is not None:
         prof_context.__enter__()
     
-    try:
-        for epoch in pbar:
-            # GPU diagnostic on first epoch
-            if epoch == 0 and torch.cuda.is_available():
-                print(f"\n[Epoch 0] GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB allocated")
-            # Shuffle indices
-            # TODO: add flag
-            perm = torch.randperm(N, device=device)
-            
-            epoch_loss = 0.0
-            n_batches = 0
-            
-
-            for batch_idx in perm.chunk(batch_size):
-                with record_function("batch_iteration"):
-                    # Slice Batch
-                    with record_function("data_slicing"):
-                        p0 = splines.start_points[batch_idx]
-                        p1 = splines.end_points[batch_idx]
-                        gt_t = splines.knots[batch_idx]
-                        gt_v = splines.values[batch_idx]
-                    
-                    with record_function("optimizer_zero_grad"):
-                        optimizer.zero_grad()
-                    
-                    # A. Vectorized Prediction
-                    with record_function("forward_pass"):
-                        pred_t, pred_v = reset_predictions_tensor_mode(mlp, p0, p1)
-                    
-                    # B. Vectorized Loss
-                    with record_function("loss_computation"):
-                        loss_sum = batch_exact_integral_loss(pred_t, pred_v, gt_t, gt_v)
-                        loss_mean = loss_sum / len(batch_idx)
-                    
-                    with record_function("backward_pass"):
-                        loss_mean.backward()
-                    
-                    with record_function("gradient_clipping"):
-                        torch.nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad_norm)
-                    
-                    with record_function("optimizer_step"):
-                        optimizer.step()
-                    
-                    epoch_loss += loss_mean.item()
-                    n_batches += 1
+    for epoch in pbar:
+        # GPU diagnostic on first epoch
+        if epoch == 0 and torch.cuda.is_available():
+            print(f"\n[Epoch 0] GPU memory: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB allocated")
+        # Shuffle indices
+        perm = torch.randperm(N, device=device)
+        
+        epoch_loss = 0.0
+        n_batches = 0
+        
+        for batch_idx in perm.chunk(batch_size):
+            with record_function("batch_iteration"):
+                # Slice Batch
+                with record_function("data_slicing"):
+                    p0 = splines.start_points[batch_idx]
+                    p1 = splines.end_points[batch_idx]
+                    knots_gt = splines.knots[batch_idx]
+                    values_gt = splines.values[batch_idx]
                 
-                # Step profiler if enabled
-                if prof_context is not None:
-                    prof_context.step()
+                with record_function("optimizer_zero_grad"):
+                    optimizer.zero_grad()
                 
-            avg_loss = epoch_loss / n_batches if n_batches > 0 else 0
-            loss_history.append(avg_loss)
+                # A. Vectorized Prediction
+                with record_function("forward_pass"):
+                    knots_pred, values_pred = forward(mlp, p0, p1)
+                
+                # B. Vectorized Loss
+                with record_function("loss_computation"):
+                    loss_sum = integral_loss(knots_pred, values_pred, knots_gt, values_gt)
+                    loss_mean = loss_sum / len(batch_idx)
+                
+                with record_function("backward_pass"):
+                    loss_mean.backward()
+                
+                with record_function("gradient_clipping"):
+                    torch.nn.utils.clip_grad_norm_(mlp.parameters(), clip_grad_norm)
+                
+                with record_function("optimizer_step"):
+                    optimizer.step()
+                
+                epoch_loss += loss_mean.item()
+                n_batches += 1
             
-            # Save best
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_epoch = epoch
-                if save_path:
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': mlp.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': best_loss,
-                    }, save_path / 'best_model_fast.pt')
-                    
-            pbar.set_postfix({'loss': f"{avg_loss:.6f}", 'best': f"{best_loss:.6f}"})
+            # Step profiler if enabled
+            if prof_context is not None:
+                prof_context.step()
+            
+        avg_loss = epoch_loss / n_batches if n_batches > 0 else 0
+        loss_history.append(avg_loss)
+        
+        # Save best
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_epoch = epoch
+            if save_path:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': mlp.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': best_loss,
+                }, save_path / 'best_model_fast.pt')
+                
+        pbar.set_postfix({'loss': f"{avg_loss:.6f}", 'best': f"{best_loss:.6f}"})
     
-    finally:
-        # Clean up profiler
-        if prof_context is not None:
-            prof_context.__exit__(None, None, None)
-            print("\n" + "="*60)
-            print("PROFILING COMPLETE")
-            print("="*60)
-            print("Trace saved to: ./profiler_logs")
-            print("\nTo view the results, run:")
-            print("  tensorboard --logdir=./profiler_logs")
-            print("\nKey stats:")
-            print(prof_context.key_averages().table(
-                sort_by="cuda_time_total" if torch.cuda.is_available() else "cpu_time_total",
-                row_limit=20
-            ))
-            print("="*60 + "\n")
-
-    print(f"\nTraining complete! Best loss: {best_loss:.6f} at epoch {best_epoch}")
     return loss_history
 
 
@@ -486,7 +400,7 @@ def update_spline_predictions(mlp: ReluMLP, splines: Splines):
         
         # Compute predictions
         with torch.no_grad():
-            pred_t, pred_v = reset_predictions_tensor_mode(mlp, p0, p1)
+            pred_t, pred_v = forward(mlp, p0, p1)
         
         # Update each spline
         for j, spline in enumerate(batch_splines):
