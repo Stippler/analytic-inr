@@ -119,11 +119,13 @@ def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
 
         verts_np = mesh.vertices.astype("float32")
 
-        centroid = verts_np.mean(axis=0)
-        verts_np = verts_np - centroid
-
+        # Center by bounding box center (not centroid) for symmetric padding
         min_coords = verts_np.min(axis=0)
         max_coords = verts_np.max(axis=0)
+        bbox_center = (min_coords + max_coords) / 2
+        verts_np = verts_np - bbox_center
+
+        # Now compute extents and scale
         extents = max_coords - min_coords
         max_extent = extents.max()
 

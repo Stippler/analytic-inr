@@ -24,8 +24,8 @@ from .utils import load_mesh_data
 @click.option('--mesh-save-interval', type=int, default=50)
 @click.option('--skip-connections/--no-skip-connections', default=False)
 @click.option('--detailed-stats/--no-detailed-stats', default=False, help='Collect detailed per-layer and spatial statistics')
-@click.option('--max-knots', type=int, default=32, help='Maximum number of knots per spline')
-@click.option('--max-candidates-per-segment', type=int, default=None, help='Maximum candidates per segment (None = no limit, e.g., 4 or 8 for speedup)')
+@click.option('--max-knots', type=int, default=16, help='Maximum number of knots per spline')
+@click.option('--max-candidates-per-segment', type=int, default=8, help='Maximum candidates per segment (None = no limit, e.g., 4 or 8 for speedup)')
 def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_knn, extract_mesh, mesh_resolution, save_dir, mesh_save_interval, skip_connections, detailed_stats, max_knots, max_candidates_per_segment):
     if model.lower() in ['simple', 'hard']:
         dim = '2d'
