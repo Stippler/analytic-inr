@@ -159,5 +159,15 @@ In your `.pt`-file, you also need the model specification, which you can get by
     ],
     "console": "integratedTerminal"
 },
+{
+    "name": "Preprocess: Armadillo",
+    "type": "debugpy",
+    "request": "launch",
+    "program": "${workspaceFolder}/scripts/preprocess.py",
+    "args": [
+        "--mesh", "Stanford_armadillo"
+    ],
+    "console": "integratedTerminal"
+},
 ```
 </details>
