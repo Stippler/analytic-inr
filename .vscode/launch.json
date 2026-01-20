@@ -8,14 +8,14 @@
             "name": "Python Debugger: Neural Spline",
             "type": "debugpy",
             "request": "launch",
-            "module": "neural_spline.main"
-        },
-        {
-            "name": "Python Debugger: Demo",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/demo.py",
-            "console": "integratedTerminal"
+            "module": "neural_spline.main",
+            "args": [
+                "--model", "Stanford_armadillo",
+                "--hidden-dim", "64",
+                "--num-layers", "4",
+                "--max-knots", "64",
+                "--max-seg-insertions", "32",
+            ]
         },
     ]
 }
