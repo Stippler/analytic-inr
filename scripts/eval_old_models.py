@@ -51,7 +51,7 @@ def eval(task_name, arch_name, mesh_name, sdf_path=None, save_mesh=True):
         raise FileNotFoundError(f"Data not found for mesh {mesh_name}")
 
     # step 1: marching cubes
-    final_mesh_path = net_dir.parent / 'mesh_final.ply'
+    final_mesh_path = net_dir / 'mesh_final.ply'
     extract_mesh_marching_cubes(net, save_path=final_mesh_path, resolution=256, device=device)
 
     eval_fast(net, data, final_mesh_path, Path("data") / "meshes" / f"{mesh_name}.ply")

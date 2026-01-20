@@ -28,6 +28,7 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+np.random.seed(SEED)
 
 from pytorch3d.loss import chamfer_distance
 
@@ -214,7 +215,7 @@ def compute_trimesh_chamfer(gt_points, gen_mesh, num_mesh_samples=100000):
 
     """
 
-    gen_points_sampled = trimesh.sample.sample_surface(gen_mesh, num_mesh_samples)[0]
+    gen_points_sampled = trimesh.sample.sample_surface(gen_mesh, num_mesh_samples, seed=SEED)[0]
 
     # only need numpy array of points
     # gt_points_np = gt_points.vertices
@@ -222,15 +223,45 @@ def compute_trimesh_chamfer(gt_points, gen_mesh, num_mesh_samples=100000):
 
     # one direction
     gen_points_kd_tree = KDTree(gen_points_sampled)
-    one_distances, one_vertex_ids = gen_points_kd_tree.query(gt_points_np)
+    one_distances, _ = gen_points_kd_tree.query(gt_points_np)
     gt_to_gen_chamfer = np.mean(np.square(one_distances))
 
     # other direction
     gt_points_kd_tree = KDTree(gt_points_np)
-    two_distances, two_vertex_ids = gt_points_kd_tree.query(gen_points_sampled)
+    two_distances, _ = gt_points_kd_tree.query(gen_points_sampled)
     gen_to_gt_chamfer = np.mean(np.square(two_distances))
 
-    return gt_to_gen_chamfer + gen_to_gt_chamfer
+    chamfer_l2 = gt_to_gen_chamfer + gen_to_gt_chamfer 
+
+    # Hausdorff Distance 
+    # (The maximum of the minimum distances)
+    # Note: KDTree returns Euclidean distances, not squared.
+    hausdorff_one = np.max(one_distances)
+    hausdorff_two = np.max(two_distances)
+    hausdorff_dist = max(hausdorff_one, hausdorff_two)
+
+    THRESHOLD = 0.005
+
+    # Precision & Recall
+    # Precision: % of generated points within threshold of GT
+    precision = np.mean(two_distances < THRESHOLD)
+    
+    # Recall: % of GT points within threshold of generated mesh
+    recall = np.mean(one_distances < THRESHOLD)
+    
+    # F-Score (Harmonic mean of P and R)
+    if precision + recall > 0:
+        f_score = 2 * (precision * recall) / (precision + recall)
+    else:
+        f_score = 0.0
+
+    return {
+        'chamfer_l2': chamfer_l2.item(),
+        'hausdorff': hausdorff_dist.item(),
+        'precision': precision.item(),
+        'recall': recall.item(),
+        'f_score': f_score.item()
+    }
 
 def eval_fast(net, data, mesh_path, gt_mesh_path):
     # step 1: marching cubes
@@ -242,7 +273,7 @@ def eval_fast(net, data, mesh_path, gt_mesh_path):
     reconstruction = trimesh.load(mesh_path)
 
     print("Step 2: Compute Chamfer Distance")
-    chamfer_dist = compute_trimesh_chamfer(
+    trimesh_metrics = compute_trimesh_chamfer(
                     ground_truth_points,
                     reconstruction,
                 )
@@ -250,9 +281,13 @@ def eval_fast(net, data, mesh_path, gt_mesh_path):
     print("Step 3: Compute IoU")
     iou = compute_IoU(data, net)
 
-    metrics = compute_meshless_metrics(net, gt_mesh_path)
-    metrics["chamfer_dist"] = chamfer_dist.item()
+    metrics = {}
+    metrics["old"] = compute_meshless_metrics(net, gt_mesh_path)
+    metrics |= trimesh_metrics
     metrics["iou"] = iou.item()
+
+    total_params = sum(p.numel() for p in net.parameters())
+    metrics["total_params"] = total_params
 
     import json
     with open(mesh_path.parent / "metrics.json", "w") as f:

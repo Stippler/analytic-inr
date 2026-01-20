@@ -93,6 +93,7 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
     if cache_path.exists():
         print(f"Found cached splines for model={model}, max_depth={max_depth}, use_knn={use_knn}")
         splines = load_splines(cache_path)
+        data = load_mesh_data(model, dim)
     else:
         print(f"No cached splines found. Computing from scratch...")
         
@@ -133,7 +134,7 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
     output_path = None
     if save_dir or extract_mesh:
         if save_dir:
-            output_path = Path(save_dir)
+            output_path = Path(save_dir) / model
         else:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_path = Path('outputs') / model / timestamp

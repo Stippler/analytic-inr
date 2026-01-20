@@ -11,10 +11,22 @@
             "module": "neural_spline.main",
             "args": [
                 "--model", "Stanford_armadillo",
-                "--hidden-dim", "64",
+                "--hidden-dim", "128",
                 "--num-layers", "4",
                 "--max-knots", "64",
                 "--max-seg-insertions", "32",
+                "--save-dir", "outputs/d4_128",
+            ]
+        },
+        {
+            "name": "Python Debugger: Evaluate Old Models",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "scripts.eval_old_models",
+            "args": [
+                "--task", "from_sdf",
+                "--arch", "relu_mlp_d4_w64",
+                "--mesh", "Stanford_armadillo",
             ]
         },
     ]
