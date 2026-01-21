@@ -75,7 +75,8 @@ def load_splines(cache_path: Path) -> Splines:
 @click.option('--skip-connections/--no-skip-connections', default=False)
 @click.option('--max-knots', type=int, default=64, help='Maximum number of knots per spline')
 @click.option('--max-seg-insertions', type=int, default=16, help='Maximum candidates per segment (None = no limit, e.g., 4 or 8 for speedup)')
-def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_knn, extract_mesh, mesh_resolution, save_dir, mesh_save_interval, skip_connections, max_knots, max_seg_insertions):
+@click.option('--quantile-length', type=float, default=0.1, help='Quantile of segment lengths to scale to')
+def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_knn, extract_mesh, mesh_resolution, save_dir, mesh_save_interval, skip_connections, max_knots, max_seg_insertions, quantile_length):
     torch.manual_seed(42)
     np.random.seed(42)
     if model.lower() in ['simple', 'hard']:
@@ -90,7 +91,7 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
     cache_dir = Path('data/cache')
     cache_path = cache_dir / f"splines_{cache_key}.pt"
     
-    if cache_path.exists():
+    if False and cache_path.exists():
         print(f"Found cached splines for model={model}, max_depth={max_depth}, use_knn={use_knn}")
         splines = load_splines(cache_path)
         data = load_mesh_data(model, dim)
@@ -112,8 +113,8 @@ def main(model, epochs, hidden_dim, num_layers, batch_size, lr, max_depth, use_k
         
         components = flatten_pca_tree(pca_tree)
 
-        splines = compute_splines(data, components, 500_000, use_knn_method=use_knn)
-        print(f"Computed {len(splines.start_points)} splines")
+        splines = compute_splines(data, components, 500_000, use_knn_method=use_knn, L_quantile=quantile_length)
+        print(f"Computed {len(splines.start_points)} splines with L_quantile={quantile_length}")
         
         # Save splines to cache
         save_splines(splines, cache_path)

@@ -18,7 +18,7 @@ HIGHLIGHT_STYLES = [
     for i in range(N_TOP_HIGHLIGHTED)
 ]
 
-COLUMNS = ["arch", "mesh", "chamfer_l1", "chamfer_l1_median", "hausdorff", "dist_gt_to_neural_mean", "dist_neural_to_gt_mean", "emd_loss"]
+COLUMNS = ["arch", "mesh", "chamfer_l2", "hausdorff", "precision", "recall", "f_score"]
 
 def highlight_top_n_cells(styler, df, styles, ascending=False):
     def make_style_func(column):
@@ -40,9 +40,9 @@ def print_latex_table(results, ascending=False):
     df = pd.DataFrame(results, columns=COLUMNS)
     df = df.groupby('arch').mean(numeric_only=True).reset_index()
     
-    # Select numeric columns
+    # Select only the metrics we care about
     df.columns = [col.replace("_", r"\_") for col in df.columns]
-    cols = df.select_dtypes(include=['number']).columns
+    cols = [c for c in df.columns if c in ["chamfer\\_l2", "hausdorff"]]
     df["arch"] = df["arch"].str.replace("_", r"\_", regex=False)
     
 
@@ -95,6 +95,15 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     calls = []
+    # for x in Path("outputs/Stanford_armadillo").iterdir():
+    #     if x.is_dir() and 'quantile' in x.name:
+    #         with open((x / 'Stanford_armadillo' / 'metrics.json'), 'r') as f:
+    #             metrics = json.load(f)
+
+    #         calls.append([x.name, "Stanford_armadillo", metrics['chamfer_l2'], metrics['hausdorff'], metrics['precision'], metrics['recall'], metrics['f_score']])
+    # # results = create_metrics_df(calls)
+    # print_latex_table(calls, ascending=True)
+    
     task_dir = root_dir / "nets" / args.task
     mesh_dir = root_dir / "data" / "meshes"
     

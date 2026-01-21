@@ -189,11 +189,11 @@ def compute_ray_geometry(start_points: torch.Tensor, end_points: torch.Tensor, m
 
     return t_hit, hit_count, hit_points, hit_normals, surface_points, surface_normals
 
-def scale_segments(start_points: torch.Tensor, end_points: torch.Tensor):
+def scale_segments(start_points: torch.Tensor, end_points: torch.Tensor, L_quantile: float):
     # Scale start and end points to new lengths
     ray_len = (end_points - start_points).norm(dim=1)  # (R,)
     assert torch.all(ray_len > 0), "Ray length is zero"
-    L = torch.quantile(ray_len, 0.1).item()
+    L = torch.quantile(ray_len, L_quantile).item()
     q = torch.ceil(ray_len / L).clamp(min=1)   # (R,)
     ray_len_q = q * L                          # (R,)
     delta = ray_len_q - ray_len    # (R,)
@@ -486,13 +486,13 @@ def get_knots_and_sdf2(
         torch.cat(all_sign_uncertain, dim=0),
     )
 
-def compute_splines(data: dict, components: List[PCAComponent], num_samples: int = 50_000, use_knn_method: bool = True) -> List[torch.Tensor]:
+def compute_splines(data: dict, components: List[PCAComponent], num_samples: int = 50_000, use_knn_method: bool = True, L_quantile: float = 0.1) -> List[torch.Tensor]:
     # Get all rays
     start_points = torch.stack([c.start for c in components], dim=0)
     end_points = torch.stack([c.end for c in components], dim=0)
     print(f"Scale Segments")
     tik = time.time()
-    start_points, end_points, L = scale_segments(start_points, end_points)
+    start_points, end_points, L = scale_segments(start_points, end_points, L_quantile=L_quantile)
     tok = time.time()
     print(f"Scale Segments took {tok - tik} seconds")
     
