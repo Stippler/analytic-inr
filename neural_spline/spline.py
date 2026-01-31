@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 import numpy as np
-from typing import List, Tuple, Dict, Optional
+from typing import Any, List, Tuple, Dict, Optional
 from tqdm import tqdm
 from pytorch3d.structures import Meshes
 from pytorch3d.ops import sample_points_from_meshes, knn_points
@@ -11,41 +11,87 @@ import time
 
 
 def sample_surface_pointcloud(
-    verts: torch.Tensor,
-    faces: torch.Tensor,
+    data: Dict[str, Any],
     num_samples: int,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Uniformly sample points AND normals on a triangle mesh surface using PyTorch3D.
+    Uniformly sample points and normals from a surface (2D polygon or 3D mesh).
+
+    For 2D: Samples points along edges with probability proportional to edge length.
+    For 3D: Samples points on triangle mesh surface using PyTorch3D.
 
     Args:
-        verts: (V, 3) float tensor
-        faces: (F, 3) long tensor
-        num_samples: number of points to sample
-        device: torch device (optional)
+        data: Dictionary containing:
+            - 'type': '2d' or '3d'
+            - For 2D: 'vertices' (N, 2) and 'edges' (E, 2)
+            - For 3D: 'vertices' (N, 3) and 'faces' (F, 3)
+        num_samples: Number of points to sample
+        device: torch device (optional, inferred from data if not provided)
 
     Returns:
-        points:  (num_samples, 3) float tensor
-        normals: (num_samples, 3) float tensor (unit length)
+        points:  (num_samples, 2) or (num_samples, 3) float tensor
+        normals: (num_samples, 2) or (num_samples, 3) float tensor (unit length)
     """
 
-    if device is None:
+    if data['type'] == '2d':
+        verts = data['vertices']
+        edges = data['edges']
         device = verts.device
-
-    mesh = Meshes(
-        verts=[verts.to(device)],
-        faces=[faces.to(device)],
-    )
-
-    # (1, N, 3), (1, N, 3)
-    points, normals = sample_points_from_meshes(
-        mesh,
-        num_samples,
-        return_normals=True,
-    )
-
-    return points[0], normals[0]
+        
+        # Get edge vertices
+        edge_verts = verts[edges]  # (num_edges, 2, 2) - for each edge, 2 endpoints with 2 coords
+        v0 = edge_verts[:, 0]  # (num_edges, 2) - start vertices
+        v1 = edge_verts[:, 1]  # (num_edges, 2) - end vertices
+        
+        # Compute edge lengths
+        edge_vectors = v1 - v0  # (num_edges, 2)
+        edge_lengths = torch.norm(edge_vectors, dim=1)  # (num_edges,)
+        
+        # Sample edges proportional to their length
+        total_length = edge_lengths.sum()
+        edge_probs = edge_lengths / total_length
+        sampled_edge_indices = torch.multinomial(
+            edge_probs, 
+            num_samples, 
+            replacement=True
+        )
+        
+        # Sample random positions along each selected edge (uniform in [0, 1])
+        t = torch.rand(num_samples, 1, device=device)  # (num_samples, 1)
+        
+        # Interpolate points along edges
+        sampled_v0 = v0[sampled_edge_indices]  # (num_samples, 2)
+        sampled_v1 = v1[sampled_edge_indices]  # (num_samples, 2)
+        points = sampled_v0 + t * (sampled_v1 - sampled_v0)  # (num_samples, 2)
+        
+        # Compute normals (perpendicular to edge direction)
+        sampled_edge_vectors = sampled_v1 - sampled_v0  # (num_samples, 2)
+        normals = torch.stack([
+            sampled_edge_vectors[:, 1],   # dy
+            -sampled_edge_vectors[:, 0]   # -dx
+        ], dim=1)  # This is a 90° CW rotation → points RIGHT/OUTWARD
+        
+        # Normalize to unit length
+        normals = normals / torch.norm(normals, dim=1, keepdim=True)
+        
+        return points, normals
+    elif data['type'] == '3d':
+        verts = data['vertices']
+        faces = data['faces']
+        device = verts.device
+        mesh = Meshes(
+            verts=[verts.to(device)],
+            faces=[faces.to(device)],
+        )
+        points, normals = sample_points_from_meshes(
+            mesh,
+            num_samples,
+            return_normals=True,
+        )
+        return points[0], normals[0]
+    else:
+        raise ValueError(f"Unsupported data type: {data['type']}")
 
 def compute_ray_geometry(start_points: torch.Tensor, end_points: torch.Tensor, mesh: trimesh.Trimesh):
     """
@@ -194,7 +240,7 @@ def scale_segments(start_points: torch.Tensor, end_points: torch.Tensor):
     ray_len = (end_points - start_points).norm(dim=1)  # (R,)
     assert torch.all(ray_len > 0), "Ray length is zero"
     L = torch.quantile(ray_len, 0.1).item()
-    q = torch.ceil(ray_len / L).clamp(min=1)   # (R,)
+    q = torch.round(ray_len / L).clamp(min=1)   # (R,) - use round for numerical stability
     ray_len_q = q * L                          # (R,)
     delta = ray_len_q - ray_len    # (R,)
     half  = 0.5 * delta            # (R,)
@@ -232,8 +278,8 @@ def subdivide_segments(
     dirs = end_points - start_points
     ray_len = torch.norm(dirs, dim=1)                    # (R,)
 
-    # Number of segments per ray (must be integer by construction)
-    n_seg = torch.ceil(ray_len / L).to(torch.long)      # (R,)
+    # Number of segments per ray (should be integer by construction, use round for numerical stability)
+    n_seg = torch.round(ray_len / L).to(torch.long).clamp(min=1)      # (R,)
     assert torch.all(n_seg >= 1)
 
     # Map each segment to its parent ray

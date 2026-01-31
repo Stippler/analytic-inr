@@ -8,7 +8,7 @@ from pytorch3d.ops import sample_points_from_meshes
 from skimage import measure
 
 
-def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
+def load_mesh_data(model: str) -> Optional[Dict[str, Any]]:
     """
     Load mesh data for 2D or 3D models.
     
@@ -16,8 +16,6 @@ def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
     -----------
     model : str
         Model name. For 2D: 'simple' or 'hard'. For 3D: mesh filename (e.g., 'Armadillo')
-    dim : str
-        Dimension: '2d' or '3d'
     
     Returns:
     --------
@@ -25,14 +23,20 @@ def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
         Dictionary containing:
         - 'type': '2d' or '3d'
         - 'mesh': trimesh.Trimesh object
-        - 'vertices': torch.Tensor of shape (N, 3)
-        - 'faces': torch.Tensor of shape (F, 3)
+        - 'vertices': torch.Tensor of shape (N, 2) for 2d or (N, 3) for 3d
+        - 'edges': torch.Tensor of shape (E, 2) [only for 2d]
+        - 'faces': torch.Tensor of shape (F, 3) [only for 3d]
         
         Returns None on error (with error messages printed)
     """
-    from .polygons import generate_polygons
+
+    if model.lower() in ['simple', 'hard']:
+        dim = '2d'
+    else:
+        dim = '3d'
     
     if dim == '2d':
+        from neural_spline.polygons import generate_polygons
         # Generate 2D polygons
         if model.lower() == "simple":
             print("  Generating simple convex polygons...")
@@ -72,23 +76,45 @@ def load_mesh_data(model: str, dim: str) -> Optional[Dict[str, Any]]:
         # Merge all prisms into one mesh
         mesh = trimesh.util.concatenate(meshes)
 
-        # Optional cleanup (safe)
-        # mesh.remove_duplicate_faces()
-        # mesh.remove_unreferenced_vertices()
-        # mesh.process(validate=True)
-
         print(f"  Mesh vertices: {len(mesh.vertices)}, faces: {len(mesh.faces)}")
 
-        # Torch tensors (from mesh)
+        # ------------------------------------------------------------
+        # Extract edges directly from 2D polygons
+        # ------------------------------------------------------------
+        all_vertices = []
+        all_edges = []
+        vertex_offset = 0
+        
+        for poly in polygons_2d:
+            poly = np.asarray(poly, dtype=np.float64)
+            n_verts = len(poly)
+            
+            # Keep as 2D
+            all_vertices.append(poly)
+            
+            # Extract edges (consecutive vertices in the polygon)
+            edges = np.array([[i, (i + 1) % n_verts] for i in range(n_verts)], dtype=np.int64)
+            edges += vertex_offset  # Offset for merged polygons
+            all_edges.append(edges)
+            
+            vertex_offset += n_verts
+        
+        # Concatenate all vertices and edges
+        vertices = np.vstack(all_vertices)  # (N, 2)
+        edges = np.vstack(all_edges)
+        
+        print(f"  Polygon vertices: {len(vertices)}, edges: {len(edges)}")
+
+        # Torch tensors (from mesh and polygons)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        verts = torch.from_numpy(mesh.vertices).float().to(device)
-        faces = torch.from_numpy(mesh.faces).long().to(device)
+        verts = torch.from_numpy(vertices).float().to(device)
+        edges_tensor = torch.from_numpy(edges).long().to(device)
 
         data = {
             "type": "2d",
             "mesh": mesh,        # for ray tracing
-            "vertices": verts,   # for PCA
-            "faces": faces,
+            "vertices": verts,   # polygon vertices
+            "edges": edges_tensor,  # polygon edges
         }
 
         return data

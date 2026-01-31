@@ -229,12 +229,17 @@ def constrained_recursive_pca(
     # Project points onto principal axes
     projections = (points - center) @ axes.T  # (N, D)
     
+    # Exclude points that lie on or very close to any splitting plane
+    # These points are already captured by the parent components
+    eps = 1e-6
+    near_plane = torch.any(torch.abs(projections) < eps, dim=1)  # (N,)
+    
     # Generate all sign combinations for subdivision (2^D octants/quadrants)
     n_subdivisions = 2 ** n_dims  # 4 for 2D, 8 for 3D
     
     for subdiv_idx in range(n_subdivisions):
-        # Create mask for this subdivision
-        mask = torch.ones(len(points), dtype=torch.bool, device=points.device)
+        # Create mask for this subdivision, starting with points NOT near any plane
+        mask = ~near_plane
         subdiv_label = ""
         
         # Create child polytope by adding splitting plane constraints
@@ -245,12 +250,12 @@ def constrained_recursive_pca(
             sign = 1 if (subdiv_idx >> dim) & 1 else -1
             
             if sign > 0:
-                dim_mask = (projections[:, dim] >= 0)
+                dim_mask = (projections[:, dim] > 0)
                 subdiv_label += '+'
                 normal = -axes[dim]
                 offset = -torch.dot(axes[dim], center)
             else:
-                dim_mask = (projections[:, dim] <= 0)
+                dim_mask = (projections[:, dim] < 0)
                 subdiv_label += '-'
                 normal = axes[dim]
                 offset = torch.dot(axes[dim], center)

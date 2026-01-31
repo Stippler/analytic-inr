@@ -48,7 +48,6 @@ def insert_zero_crossings(t: torch.Tensor,
     top_idx = torch.where(top_v, top_idx, H-1)
     sort_keys = torch.gather(alpha, dim=2, index=top_idx)
     sort_keys = torch.where(top_v, sort_keys, 2)
-    # TODO: think again if this is correct
     
     # Sort and keep only top max_candidates_per_segment
     _, sort_idx = torch.sort(sort_keys, dim=2)  # (B, K-1, max_candidates_per_segment)
@@ -181,7 +180,142 @@ class KnotForward(nn.Module):
                              eps=self.eps)
 
 
-def integral_loss(pred_t, pred_v, gt_t, gt_v, pred_valid, eps=1e-6):
+def batch_interp(t_grid, t_source, v_source, eps=1e-6):
+    """
+    Linear interpolation that handles both 2D and 3D tensors.
+    
+    Args:
+        t_grid: (B, N) query positions
+        t_source: (B, K) source positions (sorted)
+        v_source: (B, K) or (B, K, D) source values
+        eps: small value for numerical stability
+    
+    Returns:
+        (B, N) or (B, N, D) interpolated values
+    """
+    idx = torch.searchsorted(t_source.contiguous(), t_grid.contiguous())
+    max_idx = t_source.shape[1] - 1
+    idx = idx.clamp(1, max_idx)
+
+    t_left  = torch.gather(t_source, 1, idx - 1)
+    t_right = torch.gather(t_source, 1, idx)
+    
+    # Handle both 2D (B, K) and 3D (B, K, D) tensors
+    if v_source.dim() == 2:
+        v_left  = torch.gather(v_source, 1, idx - 1)
+        v_right = torch.gather(v_source, 1, idx)
+        alpha = (t_grid - t_left) / ((t_right - t_left).abs() + eps)
+    else:  # v_source.dim() == 3
+        # Expand indices for 3D gather: (B, N, D)
+        D = v_source.shape[2]
+        idx_expanded = (idx - 1).unsqueeze(-1).expand(-1, -1, D)
+        v_left = torch.gather(v_source, 1, idx_expanded)
+        idx_expanded = idx.unsqueeze(-1).expand(-1, -1, D)
+        v_right = torch.gather(v_source, 1, idx_expanded)
+        alpha = ((t_grid - t_left) / ((t_right - t_left).abs() + eps)).unsqueeze(-1)
+    
+    return v_left + alpha * (v_right - v_left)
+
+
+def batch_slerp(t_grid, t_source, normals_source, eps=1e-6):
+    """
+    Spherical linear interpolation of normals at t_grid points.
+    
+    Args:
+        t_grid: (B, N) query positions
+        t_source: (B, K) knot positions (sorted)
+        normals_source: (B, K, 3) unit normals at knots
+        eps: small value for numerical stability
+    
+    Returns:
+        (B, N, 3) SLERP-interpolated normals at t_grid positions
+    """
+    # Find which segment each t_grid point belongs to
+    idx = torch.searchsorted(t_source.contiguous(), t_grid.contiguous())
+    max_idx = t_source.shape[1] - 1
+    idx = idx.clamp(1, max_idx)
+    
+    # Get segment endpoints
+    t_left = torch.gather(t_source, 1, idx - 1)
+    t_right = torch.gather(t_source, 1, idx)
+    
+    # Get normals at segment endpoints (B, N, 3)
+    n_left = torch.gather(
+        normals_source, 1, 
+        (idx - 1).unsqueeze(-1).expand(-1, -1, 3)
+    )
+    n_right = torch.gather(
+        normals_source, 1,
+        idx.unsqueeze(-1).expand(-1, -1, 3)
+    )
+    
+    # Compute interpolation parameter alpha
+    denom = (t_right - t_left)
+    valid_denom = denom.abs() > eps
+    denom_safe = torch.where(valid_denom, denom, torch.ones_like(denom))
+    alpha = (t_grid - t_left) / denom_safe
+    alpha = alpha.clamp(0, 1).unsqueeze(-1)  # (B, N, 1)
+    
+    # SLERP computation
+    dot = (n_left * n_right).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)  # (B, N, 1)
+    omega = torch.acos(dot)
+    sin_omega = torch.sin(omega)
+    
+    # Handle near-parallel case
+    near_parallel = sin_omega.abs() < eps
+    sin_omega = torch.where(near_parallel, torch.ones_like(sin_omega), sin_omega)
+    
+    # Standard SLERP weights
+    w0 = torch.sin((1 - alpha) * omega) / sin_omega
+    w1 = torch.sin(alpha * omega) / sin_omega
+    
+    # Linear interpolation fallback for near-parallel vectors
+    w0_linear = 1 - alpha
+    w1_linear = alpha
+    
+    w0 = torch.where(near_parallel, w0_linear, w0)
+    w1 = torch.where(near_parallel, w1_linear, w1)
+    
+    result = w0 * n_left + w1 * n_right
+    
+    # Renormalize for numerical stability
+    return torch.nn.functional.normalize(result, dim=-1, eps=eps)
+
+
+def batch_step_interp(t_grid, t_source, normals_segments, eps=1e-6):
+    """
+    Step function interpolation: return normal of the left segment.
+    
+    Args:
+        t_grid: (B, N) query positions
+        t_source: (B, K) knot positions (sorted)
+        normals_segments: (B, K-1, 3) normals for each segment (constant per segment)
+        eps: small value for numerical stability
+    
+    Returns:
+        (B, N, 3) step-function normals at t_grid positions
+    """
+    # Find which segment each t_grid point belongs to
+    # searchsorted returns idx such that t_source[idx-1] <= t_grid < t_source[idx]
+    idx = torch.searchsorted(t_source.contiguous(), t_grid.contiguous())
+    
+    # Clamp to valid segment indices [0, K-2]
+    # idx - 1 gives us the left segment index
+    seg_idx = (idx - 1).clamp(0, normals_segments.shape[1] - 1)
+    
+    # Gather the segment normals
+    normals_out = torch.gather(
+        normals_segments, 1,
+        seg_idx.unsqueeze(-1).expand(-1, -1, 3)
+    )  # (B, N, 3)
+    
+    return normals_out
+
+
+
+
+def integral_loss(pred_t, pred_v, gt_t, gt_v, pred_valid,
+                  normals_pred=None, normals_gt=None, eps=1e-6):
     if pred_v.dim() == 3 and pred_v.size(-1) == 1:
         pred_v = pred_v.squeeze(-1)
     if gt_v.dim() == 3 and gt_v.size(-1) == 1:
@@ -193,24 +327,6 @@ def integral_loss(pred_t, pred_v, gt_t, gt_v, pred_valid, eps=1e-6):
     # 1) Union grid in [0,1]
     t_union = torch.cat([pred_t_src, gt_t], dim=1)
     t_union, _ = torch.sort(t_union, dim=1)
-
-    # 2) Batch linear interpolation
-    def batch_interp(t_grid, t_source, v_source):
-        idx = torch.searchsorted(t_source.contiguous(), t_grid.contiguous())
-        max_idx = t_source.shape[1] - 1
-        idx = idx.clamp(1, max_idx)
-
-        t_left  = torch.gather(t_source, 1, idx - 1)
-        t_right = torch.gather(t_source, 1, idx)
-        v_left  = torch.gather(v_source, 1, idx - 1)
-        v_right = torch.gather(v_source, 1, idx)
-
-        denom = (t_right - t_left)
-        valid_denom = denom.abs() > eps
-        denom_safe = torch.where(valid_denom, denom, torch.ones_like(denom))
-        alpha = (t_grid - t_left) / denom_safe
-        return v_left + alpha * (v_right - v_left)
-
     v_pred = batch_interp(t_union, pred_t_src, pred_v_src)
     v_gt   = batch_interp(t_union, gt_t, gt_v)
 
@@ -221,10 +337,27 @@ def integral_loss(pred_t, pred_v, gt_t, gt_v, pred_valid, eps=1e-6):
     yR = diff[:, 1:]
 
     segment_areas = (dt / 3.0) * (yL * yL + yL * yR + yR * yR)
-    return segment_areas.sum()
+    segment_loss = segment_areas.sum()
+
+    t_union = t_union[:, :-1] + dt/2.0
+    norm_gt = batch_slerp(t_union, gt_t, normals_gt)
+    norm_pred = batch_step_interp(t_union, pred_t, normals_pred)
+    norm_loss = 1.0-torch.cosine_similarity(norm_gt, norm_pred, dim=-1)
+    # weight by seg length
+    norm_loss = (norm_loss * dt).sum()
+    eikonal_loss = (normals_pred.norm(dim=-1) - 1.0).abs().sum()
+    return segment_loss, norm_loss, eikonal_loss
 
 
-def integral_norm_loss(pred_t, pred_norm, gt_t, gt_norm, pred_valid, eps=1e-6):
+def integral_loss_new(pred_t, pred_v, gt_t, gt_v, pred_valid,
+                      normals_pred=None, normals_gt=None, eps=1e-6):
+    """
+    Simplified loss for edge-based splines with exact normals.
+    
+    Since normals are now exact from edge geometry (not interpolated),
+    we can directly compare predicted gradients with ground truth normals.
+    No need for eikonal regularization or spherical interpolation.
+    """
     if pred_v.dim() == 3 and pred_v.size(-1) == 1:
         pred_v = pred_v.squeeze(-1)
     if gt_v.dim() == 3 and gt_v.size(-1) == 1:
@@ -236,35 +369,38 @@ def integral_norm_loss(pred_t, pred_norm, gt_t, gt_norm, pred_valid, eps=1e-6):
     # 1) Union grid in [0,1]
     t_union = torch.cat([pred_t_src, gt_t], dim=1)
     t_union, _ = torch.sort(t_union, dim=1)
-
-    # 2) Batch linear interpolation
-    def batch_interp(t_grid, t_source, v_source):
-        idx = torch.searchsorted(t_source.contiguous(), t_grid.contiguous())
-        max_idx = t_source.shape[1] - 1
-        idx = idx.clamp(1, max_idx)
-
-        t_left  = torch.gather(t_source, 1, idx - 1)
-        t_right = torch.gather(t_source, 1, idx)
-        v_left  = torch.gather(v_source, 1, idx - 1)
-        v_right = torch.gather(v_source, 1, idx)
-
-        denom = (t_right - t_left)
-        valid_denom = denom.abs() > eps
-        denom_safe = torch.where(valid_denom, denom, torch.ones_like(denom))
-        alpha = (t_grid - t_left) / denom_safe
-        return v_left + alpha * (v_right - v_left)
-
     v_pred = batch_interp(t_union, pred_t_src, pred_v_src)
     v_gt   = batch_interp(t_union, gt_t, gt_v)
 
-    # 3) Exact integral of squared linear diff on each segment
+    # 2) Exact integral of squared linear diff on each segment
     diff = v_pred - v_gt
     dt = t_union[:, 1:] - t_union[:, :-1]
     yL = diff[:, :-1]
     yR = diff[:, 1:]
 
     segment_areas = (dt / 3.0) * (yL * yL + yL * yR + yR * yR)
-    return segment_areas.sum()
+    segment_loss = segment_areas.sum()
+
+    # 3) Direct normal comparison at segment midpoints
+    # Interpolate ground truth normals to segment midpoints
+    t_mid = t_union[:, :-1] + dt / 2.0
+    norm_gt = batch_interp(t_mid, gt_t, normals_gt)  # (B, N-1, D)
+    
+    # Interpolate predicted normals to segment midpoints
+    # normals_pred comes from gradients, so we use step interpolation
+    # (each segment has one normal value between its knots)
+    norm_pred = batch_step_interp(t_mid, pred_t, normals_pred)  # (B, N-1, D)
+    
+    # Component-wise L2 loss weighted by segment length
+    # This directly compares each component of the normal vector
+    norm_diff = norm_pred - norm_gt  # (B, N-1, D)
+    norm_loss = (norm_diff * norm_diff).sum(dim=-1)  # (B, N-1) - sum over dimensions
+    norm_loss = (norm_loss * dt).sum()  # Weight by segment length and sum over segments
+    
+    # No eikonal loss needed - normals are exact from geometry
+    eikonal_loss = torch.tensor(0.0, device=pred_t.device, dtype=pred_t.dtype)
+    
+    return segment_loss, norm_loss, eikonal_loss
 
 
 def train_model_fast(mlp: ReluMLP,
@@ -278,7 +414,10 @@ def train_model_fast(mlp: ReluMLP,
                      mesh_resolution: int = 256,
                      mesh_save_interval: int = 50,
                      max_knots: int = 32,
-                     max_seg_insertions: int = 8):
+                     max_seg_insertions: int = 8,
+                     weight_segment: float = 1.0,
+                     weight_normal: float = 1e-3,
+                     weight_eikonal: float = 1e-6):
     device = splines.start_points.device
     mlp = mlp.to(device)
 
@@ -286,7 +425,11 @@ def train_model_fast(mlp: ReluMLP,
     N = splines.start_points.shape[0]
     n_layers = len(mlp.layers)
 
-    loss_history = []
+    # Track separate loss histories
+    segment_loss_history = []
+    normal_loss_history = []
+    eikonal_loss_history = []
+    total_loss_history = []
     best_loss = float('inf')
     
     # Global statistics across all epochs
@@ -304,13 +447,18 @@ def train_model_fast(mlp: ReluMLP,
         fullgraph=False
     )
 
-    compiled_loss = torch.compile(integral_loss, backend="inductor", mode="reduce-overhead", fullgraph=False)
+    # Use simplified loss for edge-based splines with exact normals
+    compiled_loss = torch.compile(integral_loss_new, backend="inductor", mode="reduce-overhead", fullgraph=False)
+    # compiled_loss = integral_loss_new  # Uncomment to disable compilation for debugging
     
 
     for epoch in pbar:
         perm = torch.randperm(N, device=device)
 
-        epoch_loss = 0.0
+        epoch_segment_loss = 0.0
+        epoch_normal_loss = 0.0
+        epoch_eikonal_loss = 0.0
+        epoch_total_loss = 0.0
         n_batches = 0
         
         # Epoch statistics (max over batches)
@@ -324,6 +472,7 @@ def train_model_fast(mlp: ReluMLP,
             p1 = splines.end_points[batch_idx]
             knots_gt = splines.knots[batch_idx]
             values_gt = splines.values[batch_idx]
+            normals_gt = splines.normals[batch_idx]
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -331,20 +480,24 @@ def train_model_fast(mlp: ReluMLP,
             assert batch_max_knots_layer[-1] < max_knots
             assert torch.max(batch_max_insert_knots_layer[-1]) < max_seg_insertions
             
-            # mid_t = (pred_t[:,1:].detach() + pred_t[:,:-1].detach()) / 2.0 
-            # mid_points = p0[:, None, :] + mid_t[:, :, None] * (p1 - p0)[:, None, :]
-            # mid_points.requires_grad_(True)
-            # z = mlp(mid_points)
-            # pred_norm = torch.autograd.grad(
-            #     z[pred_valid[:, 1:] & pred_valid[:, :-1]].sum(), mid_points, create_graph=True
-            # )[0]
+            mid_t = (pred_t[:,1:] + pred_t[:,:-1]) / 2.0 
+            mid_points = p0[:, None, :] + mid_t[:, :, None] * (p1 - p0)[:, None, :]
+            mid_points.requires_grad_(True)
+            z = mlp(mid_points)
+            normals_pred = torch.autograd.grad(
+                z[pred_valid[:, 1:] & pred_valid[:, :-1]].sum(), mid_points, create_graph=True
+            )[0]
             
             # Update epoch maximums
             epoch_max_knots_layer = torch.max(epoch_max_knots_layer, batch_max_knots_layer)
             epoch_max_insert_knots_layer = torch.max(epoch_max_insert_knots_layer, batch_max_insert_knots_layer)
 
-            loss_sum = compiled_loss(pred_t, pred_y, knots_gt, values_gt, pred_valid)
-            loss_mean = loss_sum / batch_idx.numel()
+            segment_loss, norm_loss, eikonal_loss = compiled_loss(
+                pred_t, pred_y, knots_gt, values_gt, pred_valid,
+                normals_pred=normals_pred,
+                normals_gt=normals_gt
+            )
+            loss_mean = (segment_loss * weight_segment + norm_loss * weight_normal + eikonal_loss * weight_eikonal) / batch_idx.numel()
 
             loss_mean.backward()
 
@@ -352,18 +505,34 @@ def train_model_fast(mlp: ReluMLP,
 
             optimizer.step()
 
-            epoch_loss += loss_mean.item()
+            # Track individual losses
+            seg_mean = (segment_loss / batch_idx.numel()).item()
+            norm_mean = (norm_loss / batch_idx.numel()).item()
+            eik_mean = (eikonal_loss / batch_idx.numel()).item()
+            
+            epoch_segment_loss += seg_mean
+            epoch_normal_loss += norm_mean
+            epoch_eikonal_loss += eik_mean
+            epoch_total_loss += loss_mean.item()
             n_batches += 1
 
-        avg_loss = epoch_loss / max(n_batches, 1)
-        loss_history.append(avg_loss)
+        # Compute average losses
+        avg_segment_loss = epoch_segment_loss / max(n_batches, 1)
+        avg_normal_loss = epoch_normal_loss / max(n_batches, 1)
+        avg_eikonal_loss = epoch_eikonal_loss / max(n_batches, 1)
+        avg_total_loss = epoch_total_loss / max(n_batches, 1)
+        
+        segment_loss_history.append(avg_segment_loss)
+        normal_loss_history.append(avg_normal_loss)
+        eikonal_loss_history.append(avg_eikonal_loss)
+        total_loss_history.append(avg_total_loss)
         
         # Update global maximums
         global_max_knots_layer = torch.max(global_max_knots_layer, epoch_max_knots_layer)
         global_max_insert_knots_layer = torch.max(global_max_insert_knots_layer, epoch_max_insert_knots_layer)
 
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if avg_total_loss < best_loss:
+            best_loss = avg_total_loss
             if save_path:
                 torch.save({
                     'epoch': epoch,
@@ -397,10 +566,12 @@ def train_model_fast(mlp: ReluMLP,
         final_knots = epoch_max_knots_layer[-1].item()
 
         pbar.set_postfix({
-            'loss': f"{avg_loss:.6f}", 
+            'total': f"{avg_total_loss:.6f}",
+            'seg': f"{avg_segment_loss:.6f}",
+            'norm': f"{avg_normal_loss:.6f}",
+            'eik': f"{avg_eikonal_loss:.6f}",
             'best': f"{best_loss:.6f}",
             'knots': f"{knots_str} | {final_knots}",
-            'ins': insert_str
         })
 
     # Print global statistics summary
@@ -419,4 +590,9 @@ def train_model_fast(mlp: ReluMLP,
         final_mesh_path = save_path / 'mesh_final.ply'
         extract_mesh_marching_cubes(mlp, save_path=final_mesh_path, resolution=mesh_resolution, device=device)
 
-    return loss_history
+    return {
+        'total': total_loss_history,
+        'segment': segment_loss_history,
+        'normal': normal_loss_history,
+        'eikonal': eikonal_loss_history,
+    }
